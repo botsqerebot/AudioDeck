@@ -8,7 +8,7 @@
 #include "AudioGeneratorFLAC.h"
 #include "AudioGeneratorMP3.h"
 #include "AudioGeneratorWAV.h"
-#include "AudioOutputI2S.h"
+#include <driver/i2s_std.h>
 #include "config.h"
 #include "psram.h"
 #include "library.h"
@@ -18,13 +18,64 @@
 // generator->stop(), which is what causes the gap), and the format can be saved
 // and restored around voice clips.
 //
-// Volume is applied here instead of in AudioOutputI2S: its gain only has 1/64 steps,
-// so the quiet end of the volume range would all round to the same level.
+// Volume is applied here, and the DAC gets 32-bit samples: at low volume the music
+// keeps its full 16-bit detail instead of being rounded back to 16 bits (that rounding
+// is the grainy hiss heard on IEMs at low volume).
 //
 // The output never sends pure digital silence. The PCM5102 mutes its analog output by
 // itself after a run of zero samples (a silent song ending, the pause before music comes
 // back after a voice clip) and unmutes on the next sound, and that switch is the small pop.
-// A 1 LSB offset (-96 dB, inaudible) keeps it from ever counting zeros.
+// A constant 1 LSB (24-bit) offset on every sample (-138 dB, inaudible) keeps it from ever
+// counting zeros, and being the same on every sample it adds no distortion.
+
+// 32-bit stereo I2S straight on the ESP-IDF driver. ConsumeSample() never blocks:
+// it returns false when the DMA is full, like AudioOutputI2S.
+class I2S32Out {
+public:
+  bool begin(int hz) {
+    i2s_chan_config_t cc = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_AUTO, I2S_ROLE_MASTER);
+    // same buffer time as the 16-bit setup: half the frames per buffer (a DMA buffer
+    // holds at most 4092 bytes), twice the buffers
+    cc.dma_desc_num = I2S_DMA_BUFFERS * 2;
+    cc.dma_frame_num = I2S_DMA_BYTES / 8;
+    if (i2s_new_channel(&cc, &tx, nullptr) != ESP_OK) return false;
+    i2s_std_config_t sc = {
+      .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG((uint32_t)hz),
+      .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO),
+      .gpio_cfg = {
+        .mclk = I2S_GPIO_UNUSED,
+        .bclk = (gpio_num_t)PIN_I2S_BCK,
+        .ws = (gpio_num_t)PIN_I2S_LRCK,
+        .dout = (gpio_num_t)PIN_I2S_DIN,
+        .din = I2S_GPIO_UNUSED,
+        .invert_flags = {.mclk_inv = false, .bclk_inv = false, .ws_inv = false},
+      },
+    };
+    if (i2s_channel_init_std_mode(tx, &sc) != ESP_OK) return false;
+    int32_t z[2] = {ANTI_MUTE, ANTI_MUTE};
+    size_t n;
+    do { n = 0; i2s_channel_preload_data(tx, z, sizeof(z), &n); } while (n);
+    on = i2s_channel_enable(tx) == ESP_OK;
+    return on;
+  }
+  void SetRate(int hz) {
+    if (!on) return;
+    i2s_std_clk_config_t clk = I2S_STD_CLK_DEFAULT_CONFIG((uint32_t)hz);
+    i2s_channel_disable(tx);
+    i2s_channel_reconfig_std_clock(tx, &clk);
+    i2s_channel_enable(tx);
+  }
+  bool ConsumeSample(const int32_t s[2]) {
+    if (!on) return false;
+    size_t n = 0;
+    i2s_channel_write(tx, s, 8, &n, 0);   // buffers are a multiple of 8 bytes: all or nothing
+    return n == 8;
+  }
+  static constexpr int32_t ANTI_MUTE = 256;   // 1 LSB at 24 bits
+private:
+  i2s_chan_handle_t tx = nullptr;
+  bool on = false;
+};
 
 // Gain that moves to a target a little every sample (fades, ducking)
 struct Ramp {
@@ -75,10 +126,12 @@ public:
   Ramp fade, duck;            // music only: pause/resume fade and ducking under the voice
   bool musicPass = false;     // set while the music decoder writes (fade, duck and voice apply)
 
-  void attach(AudioOutputI2S *o) { out = o; out->SetGain(1.0f); }
-  bool begin() override { if (!started) started = out->begin(); return started; }
-  bool SetRate(int hz) override { if (hz != rate) { rate = hz; out->SetRate(hz); } return true; }
-  bool SetChannels(int c) override { if (c != ch) { ch = c; out->SetChannels(c); } return true; }
+  bool begin() override { if (!started) started = out.begin(rate ? rate : 44100); return started; }
+  bool SetRate(int hz) override {
+    if (hz != rate) { rate = hz; out.SetRate(hz); measN = 0; measT0 = millis(); }
+    return true;
+  }
+  bool SetChannels(int c) override { ch = c; return true; }   // mono is doubled in ConsumeSample
   bool SetGain(float g) override { gain = g; return true; }
   float getGain() const { return gain; }
   bool ConsumeSample(int16_t s[2]) override {
@@ -89,9 +142,9 @@ public:
       l = lrintf(l * g) + vo;
       r = lrintf(r * g) + vo;
     }
-    int16_t v[2] = {scale(l), scale(r)};
-    if (v[0] == 0 && v[1] == 0) v[0] = v[1] = 1;     // no zero run: the DAC never auto-mutes
-    if (!out->ConsumeSample(v)) return false;
+    int32_t v[2] = {scale(l), scale(r)};
+    if (!out.ConsumeSample(v)) return false;
+    measure();
     if (musicPass) { fade.tick(); duck.tick(); voice.advance(rate); }
     return true;
   }
@@ -103,13 +156,30 @@ public:
   // DMA repeats its last buffer when starved, so feed silence whenever nothing plays
   void fillSilence() { int16_t z[2] = {0, 0}; for (int i = 0; started && i < 2048 && ConsumeSample(z); i++) {} }
 private:
-  AudioOutputI2S *out = nullptr;
+  I2S32Out out;
   bool started = false;
   int rate = 0, ch = 0, savedRate = 0, savedCh = 0;
   float gain = 1.0f;
-  int16_t scale(int32_t x) const {
-    int32_t y = lrintf(x * gain);
-    return (int16_t)constrain(y, -32768, 32767);
+  uint32_t measN = 0, measT0 = 0;
+  // The DMA only takes samples as fast as the I2S clock sends them, so samples accepted
+  // per second of millis() is the real output rate. Compare it with the rate that was set.
+  void measure() {
+#if AUDIO_RATE_DEBUG
+    measN++;
+    uint32_t dt = millis() - measT0;
+    if (dt >= 10000) {
+      Serial.printf("[rate] set %d Hz, measured %lu Hz (%.3fx)\n", rate,
+                    (unsigned long)((uint64_t)measN * 1000 / dt), rate ? measN * 1000.0f / dt / rate : 0.0f);
+      measN = 0; measT0 = millis();
+    }
+#endif
+  }
+  // 16-bit sample (or a louder mix) x volume -> 32-bit, plus the anti-mute offset.
+  // Clamped in float first: a 16-bit full scale times 65536 is the int32 limit.
+  int32_t scale(int32_t x) const {
+    float y = x * gain * 65536.0f;
+    y = constrain(y, -2147483648.0f, 2147483136.0f - I2S32Out::ANTI_MUTE);
+    return (int32_t)lrintf(y) + I2S32Out::ANTI_MUTE;
   }
 };
 
@@ -139,10 +209,6 @@ public:
   void begin() {
     mtx = xSemaphoreCreateRecursiveMutex();
     pinMode(PIN_DAC_XSMT, OUTPUT); digitalWrite(PIN_DAC_XSMT, LOW);
-    i2s = new AudioOutputI2S();
-    i2s->SetPinout(PIN_I2S_BCK, PIN_I2S_LRCK, PIN_I2S_DIN);
-    i2s->SetBuffers(I2S_DMA_BUFFERS, I2S_DMA_BYTES);
-    out.attach(i2s);
     out.SetRate(44100);
     out.SetChannels(2);
     out.begin();
@@ -340,7 +406,6 @@ private:
 
   Library &lib;
   SemaphoreHandle_t mtx = nullptr;
-  AudioOutputI2S *i2s = nullptr;
   GaplessOut out;
   uint8_t *readBuf[2] = {nullptr, nullptr};
   Slot slot[2];
@@ -572,7 +637,9 @@ private:
     active = true;
     qpos = slot[cur].qpos;
     stateDirty = true;
-    Serial.printf("[play] %d/%d %s\n", qpos + 1, (int)order.size(), trackPath(slot[cur].track));
+    JsonObject t = lib.tracks[slot[cur].track];
+    Serial.printf("[play] %d/%d %s (%u Hz, %u bit, %u ch)\n", qpos + 1, (int)order.size(), trackPath(slot[cur].track),
+                  t["sampleRate"] | 0u, t["bits"] | 0u, t["channels"] | 0u);
   }
 
   uint32_t elapsedLocked() {
@@ -689,7 +756,7 @@ private:
     if (!wasOn) updateMute();
   }
   void updateMute() {
-    bool on = ((active && !paused) || voiceOn || pendingVoice.length()) && !cutMuteUntil;
+    bool on = ((active && !paused) || voiceOn || pendingVoice.length() || HISS_TEST) && !cutMuteUntil;
     setDac(on);
   }
   void setDac(bool on) { dacOn = on; digitalWrite(PIN_DAC_XSMT, on ? HIGH : LOW); }

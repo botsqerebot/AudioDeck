@@ -1,0 +1,22 @@
+# Piper voice models: Voice Studio downloads them on first use (~60 MB each)
+voice_studio_2/voice_studio/piper_voices/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# macOS
+.DS_Store
+
+# KiCad: per-user view settings, backups, caches, lock files
+*.kicad_prl
+*-backups/
+fp-info-cache
+_autosave-*
+*.lck
+\#auto_saved_files#
+
+# Slicer output (regenerate from the STL/STEP for your printer)
+*.gcode

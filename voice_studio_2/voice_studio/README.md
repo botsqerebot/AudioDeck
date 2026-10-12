@@ -19,7 +19,7 @@ The page opens at http://127.0.0.1:5000.
 
 ## What it writes
 - `System/library.json`: the same format and sort order as the player's own scan.
-- `Voices/Menu/*.wav`: the 17 menu clips.
+- `Voices/Menu/*.wav`: the 59 menu clips (read from the firmware's `library.h` when it is in the repo).
 - `Voices/Library/*/*.wav`: one clip per song title, album, artist and genre.
 - `Voices/piper_manifest.json`: remembers which clips Piper made, so robotic clips and clips from an older voice get replaced.
 

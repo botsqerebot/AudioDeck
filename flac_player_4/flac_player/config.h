@@ -83,5 +83,7 @@
 #define REPEAT_DELAY_MS    700       // hold Prev/Next this long before it starts auto-scrolling
 #define REPEAT_RATE_MS     150
 #define BUTTON_DEBUG       1         // print every button event on Serial
+#define AUDIO_RATE_DEBUG   1         // print the real I2S output rate on Serial every 10 s
+#define HISS_TEST          0         // 1 = DAC stays unmuted while paused: hiss then = analog noise floor
 #define STATE_SAVE_MS      5000      // resume position saved this often while playing
 #define PREV_RESTART_SEC   3         // Prev after this many seconds restarts the song

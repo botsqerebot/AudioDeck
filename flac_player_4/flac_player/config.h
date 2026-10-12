@@ -40,9 +40,10 @@
 #define BAT_LOW_V       3.45f        // red LED below this
 
 // Power button holds
-#define POWER_OFF_HOLD_MS  5000      // hold Home this long to power off
-#define POWER_ON_HOLD_MS   5000      // hold Play this long to power on
+#define POWER_OFF_HOLD_MS  3000      // hold Home this long to power off
+#define POWER_ON_HOLD_MS   3000      // hold Play this long to power on
 #define CHARGE_CHECK_SEC   30        // while off and charging: wake this often to update the orange LED
+#define AUTO_OFF_MIN       10        // power off after this long with nothing playing and no button pressed
 
 #define BUTTON_ACTIVE_LOW 1          // buttons pull the pin to GND
 #define SD_SPI_HZ       40000000     // drop to 20000000 if the card gives errors
@@ -60,13 +61,19 @@
 #define READ_AHEAD_BYTES   (32 * 1024)   // per track, lives in PSRAM
 #define I2S_DMA_BUFFERS    8
 #define I2S_DMA_BYTES      2304
-#define VOLUME_STEPS       20
-#define VOLUME_DEFAULT     10
+#define VOLUME_STEPS       80            // one Vol+/Vol- press = one step
+#define VOLUME_DEFAULT     40
 #define MAX_GAIN           1.0f          // gain at full volume (ESP8266Audio allows up to 4.0)
+#define VOLUME_SAFE_START  40            // at power-on the volume is lowered to this if it was higher
+#define FADE_MS            150           // Settings > Soft fade: pause/resume fade length
+#define DUCK_LEVEL         0.25f         // Settings > Duck music: music level under a voice clip (-12 dB)
+#define DUCK_MS            60            // how fast the music dips and comes back
+#define RESUME_REWIND_SEC  3             // resuming after a long pause (or power-off) starts this much earlier
+#define RESUME_REWIND_AFTER_MS 60000     // "long pause"
 
 // ---------- Voice clips (made on the PC by Voice Studio) ----------
 #define VOICE_HOVER_DELAY_MS   150   // wait after the last press before speaking (old clip is cut at once)
-#define VOICE_RESUME_MS        1200  // music resumes this long after the last voice clip
+#define VOICE_RESUME_MS        4000  // music resumes this long after the last voice clip (time to keep scrolling)
 #define VOICE_MAX_CHARS        120   // clip names are a hash of the first 120 chars (matches Voice Studio)
 
 // ---------- Buttons ----------

@@ -2,11 +2,20 @@
 //
 //  Home ─┬─ Now Playing        (continues the last song where it stopped)
 //        ├─ Music ─┬─ Albums ────────────── album ─ songs
+//        │         ├─ Letter Album ─ letter ─ albums ─ songs   (only letters that have albums)
 //        │         ├─ Artists ─ artist ──── albums ─ songs
 //        │         ├─ Random Album         (starts playing)
 //        │         ├─ Genre ─── genre ───── albums ─ songs
 //        │         └─ All Songs ─ songs
-//        └─ Settings ─ "Scan library?"    (Play = quick scan, hold Play = full scan)
+//        └─ Settings ─┬─ Scan library ─ "Scan library?"   (Play = quick scan, hold Play = full scan)
+//                     ├─ Duck music     on/off  (voice over quieter music instead of pausing it)
+//                     ├─ Soft fade      on/off  (pause/resume fade)
+//                     ├─ Volume ticks   on/off  (tick at the lowest/highest volume)
+//                     └─ Startup chime  on/off
+//                     A toggle says its state; Play flips it.
+//
+//  Albums, Letter Album, Artists, Genre and All Songs reopen on the item you were last on.
+//  Nothing playing and no button for AUTO_OFF_MIN minutes: powers off.
 //
 //  Menus:        Prev/Next move (hold = fast), Play select, Home back, hold Home = home
 //  Now Playing:  Play pause, Prev/Next song (title is spoken), hold Play = shuffle,
@@ -22,8 +31,8 @@
 #include "engine.h"
 #include "buttons.h"
 
-enum ViewType : uint8_t { V_HOME, V_MUSIC, V_ALBUMS, V_ARTISTS, V_GENRES, V_TRACKS, V_ALL_SONGS, V_NOW_PLAYING, V_SCAN_CONFIRM };
-enum AlbumScope : uint8_t { SCOPE_ALL, SCOPE_ARTIST, SCOPE_GENRE };
+enum ViewType : uint8_t { V_HOME, V_MUSIC, V_ALBUMS, V_LETTERS, V_ARTISTS, V_GENRES, V_TRACKS, V_ALL_SONGS, V_NOW_PLAYING, V_SETTINGS, V_SCAN_CONFIRM };
+enum AlbumScope : uint8_t { SCOPE_ALL, SCOPE_ARTIST, SCOPE_GENRE, SCOPE_LETTER };
 
 struct View {
   uint8_t type = V_HOME, scope = SCOPE_ALL;
@@ -32,8 +41,14 @@ struct View {
 
 static const char *const HOME_ITEMS[] = {"Now Playing", "Music", "Settings"};
 static const char *const HOME_VOICES[] = {"home_now_playing", "home_music", "home_settings"};
-static const char *const MUSIC_ITEMS[] = {"Albums", "Artists", "Random Album", "Genre", "All Songs"};
-static const char *const MUSIC_VOICES[] = {"music_albums", "music_artists", "music_random", "music_genre", "music_all_songs"};
+static const char *const MUSIC_ITEMS[] = {"Albums", "Letter Album", "Artists", "Random Album", "Genre", "All Songs"};
+static const char *const MUSIC_VOICES[] = {"music_albums", "music_letters", "music_artists", "music_random", "music_genre", "music_all_songs"};
+static const char *const SETTINGS_ITEMS[] = {"Scan library", "Duck music", "Soft fade", "Volume ticks", "Startup chime"};
+// clip for each settings item: [item][state] (Scan library has no state)
+static const char *const SETTINGS_VOICES[][2] = {
+  {"settings_scan", "settings_scan"}, {"duck_off", "duck_on"}, {"fade_off", "fade_on"},
+  {"voltick_off", "voltick_on"}, {"chime_off", "chime_on"},
+};
 
 class Menu {
 public:
@@ -43,9 +58,10 @@ public:
     btnPrev.begin(PIN_BTN_PREV, "PREV"); btnNext.begin(PIN_BTN_NEXT, "NEXT"); btnPlay.begin(PIN_BTN_PLAY, "PLAY");
     btnHome.begin(PIN_BTN_HOME, "HOME"); btnVolUp.begin(PIN_BTN_VOLUP, "VOL+"); btnVolDn.begin(PIN_BTN_VOLDN, "VOL-");
     depth = 0; stack[0] = View();
+    lastInput = millis();
   }
 
-  void (*powerOff)() = nullptr;     // set by the sketch: hold Home 5 s
+  void (*powerOff)() = nullptr;     // set by the sketch: hold Home 3 s
 
   void enterHome() { depth = 0; stack[0] = View(); onSelectionChanged(); }
 
@@ -55,8 +71,16 @@ public:
     uint8_t ePrev = btnPrev.poll(now), eNext = btnNext.poll(now), ePlay = btnPlay.poll(now);
     uint8_t eHome = btnHome.poll(now), eUp = btnVolUp.poll(now), eDn = btnVolDn.poll(now);
 
-    if (eUp & (EV_PRESS | EV_REPEAT)) eng.setVolume(eng.getVolume() + 1);
-    if (eDn & (EV_PRESS | EV_REPEAT)) eng.setVolume(eng.getVolume() - 1);
+    if (eUp & (EV_PRESS | EV_REPEAT)) changeVolume(+1, eUp & EV_PRESS);
+    if (eDn & (EV_PRESS | EV_REPEAT)) changeVolume(-1, eDn & EV_PRESS);
+
+    // auto power-off: counts from the last button press or the moment playback stopped
+    if (ePrev | eNext | ePlay | eHome | eUp | eDn) lastInput = now;
+    if (now - lastIdleCheck >= 1000) {
+      lastIdleCheck = now;
+      if (eng.busy()) lastInput = now;
+      else if (now - lastInput >= AUTO_OFF_MIN * 60000UL && powerOff) { Serial.println("[power] idle"); powerOff(); }
+    }
 
     if (btnHome.down && !btnHome.ignore && now - btnHome.t0 >= POWER_OFF_HOLD_MS && powerOff) powerOff();
     if (eHome & EV_LONG) { enterHome(); return; }
@@ -110,7 +134,42 @@ private:
   Button btnPrev, btnNext, btnPlay, btnHome, btnVolUp, btnVolDn;
   View stack[8];
   int depth = 0;
-  uint32_t lastScanTalk = 0;
+  uint32_t lastScanTalk = 0, lastInput = 0, lastIdleCheck = 0;
+
+  // Vol+/Vol-: one step per press, a tick at the ends (if on in Settings)
+  void changeVolume(int d, bool press) {
+    int before = eng.getVolume();
+    eng.setVolume(before + d);
+    int after = eng.getVolume();
+    bool atEnd = after == 0 || after == VOLUME_STEPS;
+    if (atEnd && (after != before || press) && eng.options().volTick) eng.volumeTick();
+  }
+
+  // Lists that reopen on the item you were last on (index into the engine's saved positions)
+  static int posSlot(const View &v) {
+    switch (v.type) {
+      case V_ALBUMS: return v.scope == SCOPE_ALL ? 0 : -1;
+      case V_LETTERS: return 1;
+      case V_ARTISTS: return 2;
+      case V_GENRES: return 3;
+      case V_ALL_SONGS: return 4;
+      default: return -1;
+    }
+  }
+
+  static bool &option(Options &o, int item) {
+    switch (item) {
+      case 1: return o.duck;
+      case 2: return o.fade;
+      case 3: return o.volTick;
+      default: return o.chime;
+    }
+  }
+  const char *settingVoice(int item) {
+    if (item == 0) return SETTINGS_VOICES[0][0];
+    Options o = eng.options();
+    return SETTINGS_VOICES[item][option(o, item) ? 1 : 0];
+  }
 
   void say(const char *menuKey, bool immediate = false) {
     Serial.printf("[say] %s\n", menuKey);
@@ -121,6 +180,8 @@ private:
   void push(const View &nv) {
     if (depth < 7) depth++;
     stack[depth] = nv;
+    int slot = posSlot(nv);
+    if (slot >= 0) stack[depth].sel = eng.menuPos(slot);
     onSelectionChanged();
   }
   void back() {
@@ -132,6 +193,8 @@ private:
     View &v = stack[depth];
     int n = count(v);
     if (v.sel >= n) v.sel = n ? n - 1 : 0;
+    int slot = posSlot(v);
+    if (slot >= 0) eng.setMenuPos(slot, v.sel);
     switch (v.type) {
       case V_NOW_PLAYING: eng.speak(""); return;      // no talking over the music
       case V_SCAN_CONFIRM: say("scan_confirm"); return;
@@ -145,21 +208,25 @@ private:
   int albumAt(const View &v, int i) {
     if (v.scope == SCOPE_ARTIST) return lib.artists[v.parent]["albums"][i] | -1;
     if (v.scope == SCOPE_GENRE) return lib.genres[v.parent]["albums"][i] | -1;
+    if (v.scope == SCOPE_LETTER) return lib.letterAlbums[lib.letterStart[v.parent] + i];
     return i;
   }
 
   int count(const View &v) {
     switch (v.type) {
       case V_HOME: return 3;
-      case V_MUSIC: return 5;
+      case V_MUSIC: return 6;
       case V_ALBUMS:
         if (v.scope == SCOPE_ARTIST) return lib.artists[v.parent]["albums"].size();
         if (v.scope == SCOPE_GENRE) return lib.genres[v.parent]["albums"].size();
+        if (v.scope == SCOPE_LETTER) return lib.letterStart[v.parent + 1] - lib.letterStart[v.parent];
         return lib.albums.size();
+      case V_LETTERS: return lib.letters.size();
       case V_ARTISTS: return lib.artists.size();
       case V_GENRES: return lib.genres.size();
       case V_TRACKS: return lib.albums[v.parent]["tracks"].size();
       case V_ALL_SONGS: return lib.allSongs.size();
+      case V_SETTINGS: return 5;
       default: return 0;
     }
   }
@@ -170,10 +237,12 @@ private:
       case V_HOME: return HOME_ITEMS[i];
       case V_MUSIC: return MUSIC_ITEMS[i];
       case V_ALBUMS: return Library::str(lib.albums[albumAt(v, i)], "name");
+      case V_LETTERS: return letterName(lib.letters[i]);
       case V_ARTISTS: return Library::str(lib.artists[i], "name");
       case V_GENRES: return Library::str(lib.genres[i], "name");
       case V_TRACKS: return Library::str(lib.tracks[lib.albums[v.parent]["tracks"][i] | 0], "title");
       case V_ALL_SONGS: return Library::str(lib.tracks[lib.allSongs[i]], "title");
+      case V_SETTINGS: return SETTINGS_ITEMS[i];
       default: return "";
     }
   }
@@ -184,11 +253,14 @@ private:
       case V_ALBUMS:
         if (v.scope == SCOPE_ARTIST) return Library::str(lib.artists[v.parent], "name");
         if (v.scope == SCOPE_GENRE) return Library::str(lib.genres[v.parent], "name");
+        if (v.scope == SCOPE_LETTER) return String("Letter ") + letterName(lib.letters[v.parent]);
         return "Albums";
+      case V_LETTERS: return "Letter Album";
       case V_ARTISTS: return "Artists";
       case V_GENRES: return "Genre";
       case V_TRACKS: return Library::str(lib.albums[v.parent], "name");
       case V_ALL_SONGS: return "All Songs";
+      case V_SETTINGS: return "Settings";
       default: return "";
     }
   }
@@ -198,12 +270,22 @@ private:
       case V_HOME: return lib.menuVoice(HOME_VOICES[i]);
       case V_MUSIC: return lib.menuVoice(MUSIC_VOICES[i]);
       case V_ALBUMS: return Library::str(lib.albums[albumAt(v, i)], "voice");
+      case V_LETTERS: return letterVoice(lib.letters[i]);
       case V_ARTISTS: return Library::str(lib.artists[i], "voice");
       case V_GENRES: return Library::str(lib.genres[i], "voice");
       case V_TRACKS: return Library::str(lib.tracks[lib.albums[v.parent]["tracks"][i] | 0], "voice");
       case V_ALL_SONGS: return Library::str(lib.tracks[lib.allSongs[i]], "voice");
+      case V_SETTINGS: return lib.menuVoice(settingVoice(i));
       default: return "";
     }
+  }
+
+  static String letterName(char c) { return c == '#' ? String("#") : String((char)toupper(c)); }
+  String letterVoice(char c) {
+    if (c == '#') return lib.menuVoice("letter_other");
+    char key[] = "letter_x";
+    key[7] = c;
+    return lib.menuVoice(key);
   }
 
   void select(View &v) {
@@ -214,13 +296,24 @@ private:
           if (!eng.status().active && !eng.resumeLast()) { say("nothing_to_resume", true); return; }
           nv.type = V_NOW_PLAYING; push(nv);
         } else if (v.sel == 1) { nv.type = V_MUSIC; push(nv); }
-        else { nv.type = V_SCAN_CONFIRM; push(nv); }
+        else { nv.type = V_SETTINGS; push(nv); }
         return;
+      case V_SETTINGS: {
+        if (v.sel == 0) { nv.type = V_SCAN_CONFIRM; push(nv); return; }
+        Options o = eng.options();
+        bool &on = option(o, v.sel);
+        on = !on;
+        eng.setOptions(o);
+        Serial.printf("[menu] %s %s\n", SETTINGS_ITEMS[v.sel], on ? "on" : "off");
+        say(settingVoice(v.sel), true);
+        return;
+      }
       case V_MUSIC:
         if (!lib.loaded || lib.tracks.empty()) { say("no_library", true); return; }
         if (v.sel == 0) { nv.type = V_ALBUMS; nv.scope = SCOPE_ALL; push(nv); }
-        else if (v.sel == 1) { nv.type = V_ARTISTS; push(nv); }
-        else if (v.sel == 2) {
+        else if (v.sel == 1) { nv.type = V_LETTERS; push(nv); }
+        else if (v.sel == 2) { nv.type = V_ARTISTS; push(nv); }
+        else if (v.sel == 3) {
           int a = lib.randomAlbum();
           if (a < 0) return;
           eng.playAlbum(a, 0);
@@ -228,10 +321,11 @@ private:
           Serial.printf("[menu] random album: %s\n", Library::str(lib.albums[a], "name"));
           eng.speak(Library::str(lib.albums[a], "voice"), true);   // say which album it picked
         }
-        else if (v.sel == 3) { nv.type = V_GENRES; push(nv); }
+        else if (v.sel == 4) { nv.type = V_GENRES; push(nv); }
         else { nv.type = V_ALL_SONGS; push(nv); }
         return;
       case V_ALBUMS: nv.type = V_TRACKS; nv.parent = albumAt(v, v.sel); push(nv); return;
+      case V_LETTERS: nv.type = V_ALBUMS; nv.scope = SCOPE_LETTER; nv.parent = v.sel; push(nv); return;
       case V_ARTISTS: nv.type = V_ALBUMS; nv.scope = SCOPE_ARTIST; nv.parent = v.sel; push(nv); return;
       case V_GENRES: nv.type = V_ALBUMS; nv.scope = SCOPE_GENRE; nv.parent = v.sel; push(nv); return;
       case V_TRACKS:

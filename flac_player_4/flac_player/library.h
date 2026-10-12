@@ -28,6 +28,18 @@ static const MenuVoice MENU_VOICES[] = {
   {"scan_quick", "Quick scan. Please wait."}, {"scan_full", "Full scan. Please wait."},
   {"scan_done", "Scan complete."}, {"scan_failed", "Scan failed. Check the SD card."},
   {"power_off", "Powering off."},
+  {"music_letters", "Letter album"},
+  {"letter_a", "A"}, {"letter_b", "B"}, {"letter_c", "C"}, {"letter_d", "D"}, {"letter_e", "E"},
+  {"letter_f", "F"}, {"letter_g", "G"}, {"letter_h", "H"}, {"letter_i", "I"}, {"letter_j", "J"},
+  {"letter_k", "K"}, {"letter_l", "L"}, {"letter_m", "M"}, {"letter_n", "N"}, {"letter_o", "O"},
+  {"letter_p", "P"}, {"letter_q", "Q"}, {"letter_r", "R"}, {"letter_s", "S"}, {"letter_t", "T"},
+  {"letter_u", "U"}, {"letter_v", "V"}, {"letter_w", "W"}, {"letter_x", "X"}, {"letter_y", "Y"},
+  {"letter_z", "Z"}, {"letter_other", "Numbers and symbols"},
+  {"settings_scan", "Scan library"},
+  {"duck_on", "Duck music on"}, {"duck_off", "Duck music off"},
+  {"fade_on", "Soft fade on"}, {"fade_off", "Soft fade off"},
+  {"voltick_on", "Volume ticks on"}, {"voltick_off", "Volume ticks off"},
+  {"chime_on", "Startup chime on"}, {"chime_off", "Startup chime off"},
 };
 static const size_t MENU_VOICE_COUNT = sizeof(MENU_VOICES) / sizeof(MENU_VOICES[0]);
 
@@ -57,6 +69,18 @@ public:
   bool loaded = false;
   PVec<JsonObject> tracks, albums, artists, genres;
   PVec<uint16_t> allSongs;
+  // Letter Album: first letters that have albums ('a'-'z', then '#' for anything else).
+  // The albums of letters[i] are letterAlbums[letterStart[i] .. letterStart[i + 1]).
+  PVec<char> letters;
+  PVec<uint16_t> letterStart, letterAlbums;
+
+  // Same folding as the album sort ("The " skipped, accents folded), so a letter's
+  // albums come in the same order as in Albums
+  static char letterOf(JsonObject album) {
+    String k = sortKey(String(str(album, "name")));
+    char c = k.length() ? k[0] : 0;
+    return (c >= 'a' && c <= 'z') ? c : '#';
+  }
 
   static const char *str(JsonObject o, const char *key) { const char *s = o[key]; return s ? s : ""; }
 
@@ -344,7 +368,10 @@ public:
 private:
   JsonDocument doc;
 
-  void clearIndex() { tracks.clear(); albums.clear(); artists.clear(); genres.clear(); allSongs.clear(); }
+  void clearIndex() {
+    tracks.clear(); albums.clear(); artists.clear(); genres.clear(); allSongs.clear();
+    letters.clear(); letterStart.clear(); letterAlbums.clear();
+  }
 
   void buildIndex() {
     clearIndex();
@@ -353,5 +380,18 @@ private:
     for (JsonObject o : doc["artists"].as<JsonArray>()) artists.push_back(o);
     for (JsonObject o : doc["genres"].as<JsonArray>()) genres.push_back(o);
     for (JsonVariant v : doc["allSongs"].as<JsonArray>()) allSongs.push_back(v.as<uint16_t>());
+    buildLetters();
+  }
+
+  void buildLetters() {
+    PVec<char> of(albums.size());
+    for (size_t a = 0; a < albums.size(); a++) of[a] = letterOf(albums[a]);
+    for (int i = 0; i < 27; i++) {
+      char c = i < 26 ? 'a' + i : '#';
+      size_t from = letterAlbums.size();
+      for (size_t a = 0; a < albums.size(); a++) if (of[a] == c) letterAlbums.push_back(a);
+      if (letterAlbums.size() > from) { letters.push_back(c); letterStart.push_back(from); }
+    }
+    letterStart.push_back(letterAlbums.size());
   }
 };

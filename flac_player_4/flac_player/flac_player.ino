@@ -25,7 +25,7 @@ Library library;
 Engine engine(library);
 Menu menu(library, engine);
 
-// Hold Home 5 s: say goodbye, save the resume point, switch everything off, deep sleep
+// Hold Home 3 s: say goodbye, save the resume point, switch everything off, deep sleep
 static void powerOff() {
   Serial.println("[power] off");
   engine.speak(library.menuVoice("power_off"), true);
@@ -55,7 +55,7 @@ void setup() {
 #endif
 #endif
 
-  Power::handleWake();                 // woke from power-off: only continue after Play was held 5 s
+  Power::handleWake();                 // woke from power-off: only continue after Play was held 3 s
 
   pinMode(PIN_DAC_XSMT, OUTPUT); digitalWrite(PIN_DAC_XSMT, LOW);   // muted until something plays
   pinMode(PIN_LDO_EN, OUTPUT);   digitalWrite(PIN_LDO_EN, HIGH);    // analog regulator on
@@ -86,6 +86,7 @@ void setup() {
   Serial.printf("Library: %s, %u tracks, %u albums in %lu ms\n", haveLib ? "loaded" : "missing",
                 (unsigned)library.tracks.size(), (unsigned)library.albums.size(), (unsigned long)(millis() - t0));
   engine.loadState();
+  if (engine.options().chime) engine.chime();     // ready (Settings > Startup chime)
 
   menu.enterHome();                    // says "Now playing"
   if (!haveLib) engine.speak(library.menuVoice("no_library"), true);

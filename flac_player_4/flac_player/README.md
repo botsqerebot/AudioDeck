@@ -16,14 +16,16 @@ ESP32-S3 N16R8 FLAC/MP3 player with **no screen**. The menu is a "virtual menu":
 |---|---|---|---|---|---|---|
 | Menus | move, the item is spoken (hold = fast) | select | back (repeats the item at the top level) | – | – | home |
 | Now Playing | previous / next song (quiet) | pause | back | shuffle on/off | repeat off/all/one | home |
+| Settings | move, the item and its state are spoken | flip the toggle (or open Scan library) | back | – | – | home |
 | Scan question | – | quick scan | cancel | full scan | – | – |
 
 Vol+ and Vol- work everywhere. Prev restarts the song if it has played for more than 3 s.
 
 ## Power
 
-- **Off:** hold Home for 5 s. It says "Powering off", saves where you were, switches off the analog regulator, amp and DAC, and puts the ESP32 into deep sleep.
-- **On:** hold Play for 5 s. The green LED blinks while you hold, then the player starts. A shorter press goes back to sleep.
+- **Off:** hold Home for 3 s. It says "Powering off", saves where you were, switches off the analog regulator, amp and DAC, and puts the ESP32 into deep sleep.
+- **On:** hold Play for 3 s. The green LED blinks while you hold, then the player starts. A shorter press goes back to sleep.
+- **Auto off:** with nothing playing and no button pressed for 10 minutes (`AUTO_OFF_MIN`), it powers off the same way.
 - **LEDs:** green = on, orange = charging (also while off), red = low battery.
 - **While off and charging,** it wakes for a moment every 30 s to update the orange LED. Unplugged, it only wakes for Play or when a charger is plugged in.
 - **LED pins:** green 38, purple 39 (off), orange 40, blue 41 (off), red 42.
@@ -31,8 +33,13 @@ Vol+ and Vol- work everywhere. Prev restarts the song if it has played for more 
 
 ## What you hear
 
-- **Moving in a menu:** a press cuts the clip that is playing at once, and the new item is spoken 0.15 s later. Music pauses for the clip and comes back 1.2 s later.
+- **Moving in a menu:** a press cuts the clip that is playing at once, and the new item is spoken 0.15 s later. With **Duck music** on (Settings), music keeps playing quieter under the voice. With it off, music pauses for the clip and comes back 4 s later, so you have time to keep scrolling.
 - **Albums:** song titles are spoken while you browse an album. Once a song plays, Prev/Next change songs without talking, and the album plays to the end.
+- **Letter Album:** Prev/Next steps through the first letters of your albums (only letters that have albums, "Numbers and symbols" last). Play opens that letter's albums. "The" is skipped, like in the A-Z sort.
+- **Volume:** 80 steps. A saved volume from the old 20-step firmware is converted on the first boot. At power-on the volume is lowered to 50% if it was left higher. With **Volume ticks** on, a tick plays when you reach the lowest or highest volume.
+- **Remembered lists:** Albums, Letter Album, Artists, Genre and All Songs reopen on the item you were last on, also after a power-off.
+- **Pause/resume:** with **Soft fade** on, the music fades out and in. Resuming after more than a minute, or after power-off, starts 3 s earlier.
+- **Startup chime:** two short rising tones at power-on (Settings > Startup chime).
 - **Random Album:** says the name of the album it picked.
 - **Picking a song from a menu** always plays in order with shuffle and repeat off.
 - **Missing clip:** a short tick.

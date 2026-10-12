@@ -1,7 +1,7 @@
 // power.h — power off (deep sleep), power on with a long Play press, status LEDs.
 //
-//  Off:      hold Home 5 s  -> "Powering off", analog regulator, amp and DAC off, deep sleep
-//  On:       hold Play 5 s  -> green LED blinks while you hold, then the player starts
+//  Off:      hold Home 3 s  -> "Powering off", analog regulator, amp and DAC off, deep sleep
+//  On:       hold Play 3 s  -> green LED blinks while you hold, then the player starts
 //  LEDs:     green = on, orange = charging (also while off), red = low battery,
 //            purple and blue are kept off
 //
@@ -71,7 +71,7 @@ static void holdLow(int pin) {
   for (int p : leds) if (p >= 0) gpio_hold_en((gpio_num_t)p);
   gpio_deep_sleep_hold_en();
 
-  // wake on Play (held for 5 s is checked after waking)
+  // wake on Play (held for 3 s is checked after waking)
   rtc_gpio_init((gpio_num_t)PIN_BTN_PLAY);
   rtc_gpio_set_direction((gpio_num_t)PIN_BTN_PLAY, RTC_GPIO_MODE_INPUT_ONLY);
   rtc_gpio_pullup_en((gpio_num_t)PIN_BTN_PLAY);

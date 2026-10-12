@@ -49,6 +49,14 @@ MENU_VOICES = [
     ("scan_done", "Scan complete."),
     ("scan_failed", "Scan failed. Check the SD card."),
     ("power_off", "Powering off."),
+    ("music_letters", "Letter album"),
+] + [(f"letter_{c.lower()}", c) for c in "ABCDEFGHIJKLMNOPQRSTUVWXYZ"] + [
+    ("letter_other", "Numbers and symbols"),
+    ("settings_scan", "Scan library"),
+    ("duck_on", "Duck music on"), ("duck_off", "Duck music off"),
+    ("fade_on", "Soft fade on"), ("fade_off", "Soft fade off"),
+    ("voltick_on", "Volume ticks on"), ("voltick_off", "Volume ticks off"),
+    ("chime_on", "Startup chime on"), ("chime_off", "Startup chime off"),
 ]
 
 

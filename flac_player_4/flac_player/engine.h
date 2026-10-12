@@ -17,23 +17,100 @@
 // Output wrapper: I2S stays up between tracks (ESP8266Audio stops it on every
 // generator->stop(), which is what causes the gap), and the format can be saved
 // and restored around voice clips.
+//
+// Volume is applied here instead of in AudioOutputI2S: its gain only has 1/64 steps,
+// so the quiet end of the volume range would all round to the same level.
+//
+// The output never sends pure digital silence. The PCM5102 mutes its analog output by
+// itself after a run of zero samples (a silent song ending, the pause before music comes
+// back after a voice clip) and unmutes on the next sound, and that switch is the small pop.
+// A 1 LSB offset (-96 dB, inaudible) keeps it from ever counting zeros.
+
+// Gain that moves to a target a little every sample (fades, ducking)
+struct Ramp {
+  float v = 1, target = 1, step = 0;
+  void set(float x) { v = target = x; }
+  void to(float t, int ms, int hz) { target = t; step = fabsf(t - v) / max(1, hz * ms / 1000); }
+  void tick() { if (v < target) v = min(target, v + step); else if (v > target) v = max(target, v - step); }
+  bool done() const { return v == target; }
+};
+
+// Ducking: the voice clip decoder writes here instead of to the DAC, and the music
+// output mixes it in. Mono, at the clip's own rate; both sides run in the audio task.
+class VoiceSink : public AudioOutput {
+public:
+  bool begin() override { return true; }
+  bool SetRate(int hz) override { rate = hz; return true; }
+  bool SetChannels(int c) override { ch = c; return true; }
+  bool ConsumeSample(int16_t s[2]) override {
+    if (count >= N) return false;
+    buf[(head + count) % N] = ch == 1 ? s[0] : (int16_t)((s[0] + s[1]) / 2);
+    count++;
+    return true;
+  }
+  bool stop() override { return true; }              // what is buffered still plays out
+  void clear() { head = count = 0; phase = 0; }
+  bool empty() const { return count == 0; }
+  // current voice sample at the music rate (linear interpolation), advance() moves on
+  int16_t peek() const {
+    if (!count) return 0;
+    int16_t a = buf[head], b = count > 1 ? buf[(head + 1) % N] : a;
+    return a + (int16_t)((b - a) * phase);
+  }
+  void advance(int outRate) {
+    if (!count || outRate <= 0) return;
+    phase += (float)rate / outRate;
+    while (phase >= 1 && count) { phase -= 1; head = (head + 1) % N; count--; }
+  }
+private:
+  static const int N = 4096;
+  int16_t buf[N];
+  int head = 0, count = 0, rate = 22050, ch = 1;
+  float phase = 0;
+};
+
 class GaplessOut : public AudioOutput {
 public:
-  void attach(AudioOutputI2S *o) { out = o; }
+  VoiceSink voice;            // ducked voice clip, mixed into the music
+  Ramp fade, duck;            // music only: pause/resume fade and ducking under the voice
+  bool musicPass = false;     // set while the music decoder writes (fade, duck and voice apply)
+
+  void attach(AudioOutputI2S *o) { out = o; out->SetGain(1.0f); }
   bool begin() override { if (!started) started = out->begin(); return started; }
   bool SetRate(int hz) override { if (hz != rate) { rate = hz; out->SetRate(hz); } return true; }
   bool SetChannels(int c) override { if (c != ch) { ch = c; out->SetChannels(c); } return true; }
-  bool SetGain(float g) override { return out->SetGain(g); }
-  bool ConsumeSample(int16_t s[2]) override { return out->ConsumeSample(s); }
+  bool SetGain(float g) override { gain = g; return true; }
+  float getGain() const { return gain; }
+  bool ConsumeSample(int16_t s[2]) override {
+    int32_t l = s[0], r = ch == 1 ? s[0] : s[1];
+    if (musicPass) {
+      float g = fade.v * duck.v;
+      int32_t vo = voice.peek();
+      l = lrintf(l * g) + vo;
+      r = lrintf(r * g) + vo;
+    }
+    int16_t v[2] = {scale(l), scale(r)};
+    if (v[0] == 0 && v[1] == 0) v[0] = v[1] = 1;     // no zero run: the DAC never auto-mutes
+    if (!out->ConsumeSample(v)) return false;
+    if (musicPass) { fade.tick(); duck.tick(); voice.advance(rate); }
+    return true;
+  }
   bool stop() override { return true; }               // swallowed: never tear down I2S per track
   void saveFormat() { savedRate = rate; savedCh = ch; }
   void restoreFormat() { if (savedRate) SetRate(savedRate); if (savedCh) SetChannels(savedCh); }
-  // DMA repeats its last buffer when starved, so feed zeros whenever nothing plays
-  void fillSilence() { int16_t z[2] = {0, 0}; for (int i = 0; started && i < 2048 && out->ConsumeSample(z); i++) {} }
+  void fadeTo(float t, int ms) { fade.to(t, ms, rate); }
+  void duckTo(float t, int ms) { duck.to(t, ms, rate); }
+  // DMA repeats its last buffer when starved, so feed silence whenever nothing plays
+  void fillSilence() { int16_t z[2] = {0, 0}; for (int i = 0; started && i < 2048 && ConsumeSample(z); i++) {} }
 private:
   AudioOutputI2S *out = nullptr;
   bool started = false;
   int rate = 0, ch = 0, savedRate = 0, savedCh = 0;
+  float gain = 1.0f;
+  int16_t scale(int32_t x) const {
+    int32_t y = lrintf(x * gain);
+    return (int16_t)constrain(y, -32768, 32767);
+  }
 };
 
 enum QueueType : uint8_t { Q_NONE = 0, Q_ALBUM = 1, Q_ALL_SONGS = 2 };
@@ -45,6 +122,15 @@ struct PlayerStatus {
   int track = -1, pos = 0, len = 0, volume = VOLUME_DEFAULT;
   uint32_t elapsed = 0, duration = 0;
 };
+
+// Settings menu toggles, saved in state.json
+struct Options {
+  bool duck = true;       // voice over quieter music instead of pausing it
+  bool fade = true;       // soft fade on pause/resume
+  bool volTick = true;    // tick at the lowest and highest volume
+  bool chime = true;      // two-tone chime at power-on
+};
+#define MENU_POS_COUNT 5  // remembered list positions (see Menu::posSlot)
 
 class Engine {
 public:
@@ -73,7 +159,18 @@ public:
   void togglePause() {
     Lock l(mtx);
     if (!active) { resumeSaved(); return; }
-    paused = !paused;
+    if (pausing) { pausing = false; out.fadeTo(1, FADE_MS); return; }    // pressed again mid-fade
+    if (!paused) {
+      pausedAt = millis();
+      bool sounding = (int32_t)(millis() - musicResumeAt) >= 0;          // not held for a voice clip
+      if (opts.fade && sounding) { pausing = true; out.fadeTo(0, FADE_MS); return; }   // loop() pauses when the fade ends
+      paused = true;
+    } else {
+      paused = false;
+      musicResumeAt = 0;                       // Play means now, not after the voice pause
+      if (millis() - pausedAt >= RESUME_REWIND_AFTER_MS) rewind(RESUME_REWIND_SEC);
+      if (opts.fade) { out.fade.set(0); out.fadeTo(1, FADE_MS); }
+    }
     stateDirty = true;
     updateMute();
   }
@@ -112,6 +209,34 @@ public:
   }
   int getVolume() { return volume; }
 
+  // Volume tick: the audio task plays it, so the buttons never wait
+  void volumeTick() { tickReq = true; }
+
+  Options options() { Lock l(mtx); return opts; }
+  void setOptions(const Options &o) { Lock l(mtx); opts = o; stateDirty = true; }
+
+  // Remembered menu list positions. Saved with the next state write (not on every
+  // scroll step, that would write the SD card all the time).
+  int menuPos(int i) { Lock l(mtx); return (i >= 0 && i < MENU_POS_COUNT) ? menuPosSaved[i] : 0; }
+  void setMenuPos(int i, int sel) { Lock l(mtx); if (i >= 0 && i < MENU_POS_COUNT) menuPosSaved[i] = sel; }
+
+  // Music or a voice clip is playing (auto power-off waits while this is true)
+  bool busy() { Lock l(mtx); return (active && !paused) || voiceOn || pendingVoice.length(); }
+
+  // Two soft rising tones at power-on (blocking)
+  void chime() {
+    Lock l(mtx);
+    setDac(true);
+    out.saveFormat();
+    out.SetRate(22050);
+    out.SetChannels(2);
+    tone(660, 90);
+    tone(880, 120);
+    drainSilence(120);
+    out.restoreFormat();
+    updateMute();
+  }
+
   // Voice clip for the highlighted item. Never blocks the buttons: the request goes into a
   // mailbox, and the audio task cuts the clip that is playing within ~1 ms.
   // An empty path just stops the current clip. A path to a missing file plays a short tick.
@@ -148,7 +273,7 @@ public:
     Lock l(mtx);
     saveStateLocked();
     stopSlots();
-    active = false; paused = false;
+    active = false; paused = false; pausing = false;
     pendingVoice = ""; stopVoice();
     updateMute();
   }
@@ -158,7 +283,7 @@ public:
 
   // After a rescan track ids change, so forget the in-memory queue (the saved
   // state keeps the file path and is matched again on resume)
-  void resetQueue() { Lock l(mtx); stopSlots(); active = false; items.clear(); order.clear(); qtype = Q_NONE; qpos = -1; updateMute(); }
+  void resetQueue() { Lock l(mtx); stopSlots(); active = false; pausing = false; items.clear(); order.clear(); qtype = Q_NONE; qpos = -1; updateMute(); }
 
   PlayerStatus status() {
     Lock l(mtx);
@@ -186,9 +311,17 @@ public:
     Lock l(mtx);
     JsonDocument st;
     if (!readState(st)) return;
-    setVolume(st["volume"] | VOLUME_DEFAULT);
+    int v = st["volume"] | VOLUME_DEFAULT, steps = st["volSteps"] | 20;   // older files used 20 steps
+    if (steps > 0 && steps != VOLUME_STEPS) v = (v * VOLUME_STEPS + steps / 2) / steps;
+    setVolume(min(v, VOLUME_SAFE_START));                  // never start loud
     shuffle = st["shuffle"] | false;
     repeat = st["repeat"] | 0;
+    JsonObject o = st["options"];
+    opts.duck = o["duck"] | true;
+    opts.fade = o["fade"] | true;
+    opts.volTick = o["volTick"] | true;
+    opts.chime = o["chime"] | true;
+    for (int i = 0; i < MENU_POS_COUNT; i++) menuPosSaved[i] = st["menu"][i] | 0;
     stateDirty = false;
   }
 
@@ -214,6 +347,10 @@ private:
   int cur = 0;
   bool prepared = false, nextReady = false;
   bool active = false, paused = false;
+  bool pausing = false;            // fading out, paused when the fade ends
+  uint32_t pausedAt = 0;
+  Options opts;
+  int menuPosSaved[MENU_POS_COUNT] = {0};
 
   // queue
   uint8_t qtype = Q_NONE;
@@ -228,7 +365,8 @@ private:
   // voice + button mailboxes
   AudioFileSourceSD voiceSrc;
   AudioGeneratorWAV voiceGen;
-  bool voiceOn = false;
+  bool voiceOn = false, voiceMixed = false;    // voiceMixed: the clip plays over ducked music
+  volatile bool tickReq = false;
   uint32_t voiceTail = 0;
   String pendingVoice;
   portMUX_TYPE mbMux = portMUX_INITIALIZER_UNLOCKED;
@@ -270,7 +408,13 @@ private:
       if (!pendingVoice.length()) musicResumeAt = 0;
     }
     if (cutMuteUntil && (int32_t)(now - cutMuteUntil) >= 0) { cutMuteUntil = 0; updateMute(); }
-    if (voiceOn) {
+    if (voiceOn && voiceMixed) {
+      if (!active || paused) stopVoice();          // music stopped under the clip: drop it
+      else {
+        if (voiceGen.isRunning() && !voiceGen.loop()) { voiceGen.stop(); voiceSrc.close(); }   // top up the mix buffer
+        if (!voiceGen.isRunning() && out.voice.empty()) stopVoice();                          // clip fully heard
+      }
+    } else if (voiceOn) {
       if (!voiceTail) {
         if (voiceGen.isRunning() && voiceGen.loop()) return;
         voiceGen.stop(); voiceSrc.close();
@@ -279,13 +423,33 @@ private:
       if ((int32_t)(now - voiceTail) < 0) { out.fillSilence(); return; }
       stopVoice();
       musicResumeAt = now + VOICE_RESUME_MS;
+      if (opts.fade) { out.fade.set(0); out.fadeTo(1, FADE_MS); }   // music fades back in
       updateMute();
     }
-    if (pendingVoice.length() && !cutMuteUntil && (int32_t)(now - voiceAt) >= 0) { startVoice(); return; }
+    if (pendingVoice.length() && !cutMuteUntil && (int32_t)(now - voiceAt) >= 0) {
+      startVoice();
+      if (!voiceMixed) return;
+    }
+    if (tickReq && !(voiceOn && !voiceMixed)) {    // not in the middle of a clip on its own
+      tickReq = false;
+      float g = out.getGain(), x = 0.2f;           // audible even at volume 0
+      out.SetGain(max(g, MAX_GAIN * x * x));
+      playTick();
+      out.SetGain(g);
+    }
 
     // ---- music ----
-    if (active && !paused && (int32_t)(now - musicResumeAt) >= 0) musicStep();
-    else out.fillSilence();
+    if (pausing && (!active || out.fade.done())) {  // fade-out finished: now really paused
+      pausing = false;
+      if (active) { paused = true; stateDirty = true; }
+      updateMute();
+    }
+    if (!voiceMixed && !pendingVoice.length() && out.duck.target != 1) out.duckTo(1, DUCK_MS);   // clip over: music back up
+    if (active && !paused && (voiceMixed || (int32_t)(now - musicResumeAt) >= 0)) {
+      out.musicPass = true;
+      musicStep();
+      out.musicPass = false;
+    } else out.fillSilence();
   }
 
   // ---------- gapless core ----------
@@ -387,10 +551,22 @@ private:
     return true;
   }
   void playAt(int p, uint32_t resumeFilePos) {
+    pausing = false;
+    out.fade.set(1);
     if (!startAt(p, resumeFilePos)) { active = false; updateMute(); return; }
     paused = false;
     musicResumeAt = 0;
     updateMute();
+  }
+  // Restart the current song a few seconds back (after a long pause)
+  void rewind(uint32_t sec) {
+    Slot &s = slot[cur];
+    if (!s.src || s.track < 0) return;
+    uint32_t dur = lib.tracks[s.track]["duration"] | 0u;
+    uint32_t fp = s.src->filePos(), a = s.src->audioStart(), b = s.src->audioEnd();
+    if (!dur || b <= a || fp <= a) return;
+    uint32_t back = (uint32_t)((uint64_t)(b - a) * sec / dur);
+    playAt(s.qpos, fp > a + back ? fp - back : 0);       // 0 = from the start
   }
   void songStarted() {
     active = true;
@@ -451,9 +627,18 @@ private:
   void startVoice() {
     String p = pendingVoice; pendingVoice = "";
     if (!voiceSrc.open(p.c_str())) { playTick(); return; }      // clip not made yet
+    voiceTail = 0;
+    // Ducking: music is really sounding, so mix the clip over it instead of pausing it
+    if (opts.duck && active && !paused && !pausing && (int32_t)(millis() - musicResumeAt) >= 0) {
+      out.voice.clear();
+      voiceOn = voiceMixed = voiceGen.begin(&voiceSrc, &out.voice);
+      if (voiceOn) out.duckTo(DUCK_LEVEL, DUCK_MS);
+      else voiceSrc.close();
+      return;
+    }
+    if (pausing) { pausing = false; paused = true; stateDirty = true; }   // mid fade-out: just be paused
     out.saveFormat();
     voiceOn = voiceGen.begin(&voiceSrc, &out);
-    voiceTail = 0;
     if (!voiceOn) { voiceSrc.close(); out.restoreFormat(); }
     updateMute();
   }
@@ -461,15 +646,18 @@ private:
     if (!voiceOn) return;
     voiceGen.stop();
     voiceSrc.close();
-    out.restoreFormat();
-    voiceOn = false;
+    if (voiceMixed) out.voice.clear(); else out.restoreFormat();
+    voiceOn = voiceMixed = false;
     voiceTail = 0;
   }
   // Stop the clip mid-word: mute the DAC at once while the DMA drains, so the old
-  // clip is never heard after the button press.
+  // clip is never heard after the button press. A ducked clip just leaves the mix
+  // (the music keeps playing, and stays ducked if another clip is coming).
   void cutVoice() {
     if (!voiceOn) return;
+    bool mixed = voiceMixed;
     stopVoice();
+    if (mixed) return;
     cutMuteUntil = millis() + 130;
     setDac(false);
   }
@@ -512,8 +700,16 @@ private:
     stateDirty = false;
     JsonDocument st;
     st["volume"] = volume;
+    st["volSteps"] = VOLUME_STEPS;
     st["shuffle"] = shuffle;
     st["repeat"] = repeat;
+    JsonObject o = st["options"].to<JsonObject>();
+    o["duck"] = opts.duck;
+    o["fade"] = opts.fade;
+    o["volTick"] = opts.volTick;
+    o["chime"] = opts.chime;
+    JsonArray mp = st["menu"].to<JsonArray>();
+    for (int i = 0; i < MENU_POS_COUNT; i++) mp.add(menuPosSaved[i]);
     if (qtype != Q_NONE && !items.empty() && qpos >= 0 && qpos < (int)order.size()) {
       st["queue"] = qtype;
       st["id"] = qid;
@@ -561,6 +757,14 @@ private:
       if (first >= (int)items.size()) first = item;
       shuffleFrom(first, st["seed"] | 1u);
     } else makeIdentity();
-    playAt(findPos(item), st["file"] | 0u);
+    // start a few seconds before where it stopped, so the last words aren't missed
+    uint32_t file = st["file"] | 0u;
+    JsonObject t = lib.tracks[items[item]];
+    uint32_t dur = t["duration"] | 0u, size = t["size"] | 0u, start = t["dataStart"] | 0u;
+    if (file && dur && size > start) {
+      uint32_t back = (uint32_t)((uint64_t)(size - start) * RESUME_REWIND_SEC / dur);
+      file = file > start + back ? file - back : 0;
+    }
+    playAt(findPos(item), file);
   }
 };

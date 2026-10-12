@@ -1,0 +1,2 @@
+flask>=3.0
+piper-tts>=1.3

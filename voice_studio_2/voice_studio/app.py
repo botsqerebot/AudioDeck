@@ -55,7 +55,9 @@ def get_tts(voice, speed):
 
 
 def menu_items():
-    for p in (HERE / "library.h", HERE.parent / "flac_player" / "library.h"):
+    # next to the app, or the firmware in the repo (newest flac_player_N first)
+    fw = sorted(HERE.parent.parent.glob("flac_player*/flac_player/library.h"), reverse=True)
+    for p in (HERE / "library.h", HERE.parent / "flac_player" / "library.h", *fw):
         items = fb.read_library_h(p)
         if items:
             return items

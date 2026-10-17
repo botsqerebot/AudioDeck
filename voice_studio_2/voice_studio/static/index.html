@@ -1,0 +1,330 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Voice Studio</title>
+<style>
+:root{--bg:#f6f5f2;--card:#fff;--ink:#1d1d1f;--mute:#6b6b70;--line:#e3e1dc;--acc:#2f6f5e;--acc2:#e8f1ee;--bad:#b3261e}
+@media (prefers-color-scheme:dark){:root{--bg:#141414;--card:#1e1e1e;--ink:#eee;--mute:#9a9a9a;--line:#333;--acc:#5fb39b;--acc2:#1f2d29;--bad:#ff8a80}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.45 system-ui,-apple-system,Segoe UI,sans-serif}
+main{max-width:980px;margin:0 auto;padding:28px 16px 60px}
+h1{font-size:22px;margin:0 0 4px}p.sub{color:var(--mute);margin:0 0 22px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:18px;margin-bottom:16px}
+.card h2{font-size:13px;letter-spacing:.06em;text-transform:uppercase;color:var(--mute);margin:0 0 12px}
+.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+input[type=text],input[type=search],select{font:inherit;color:inherit;background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:8px 10px}
+input[type=text],input[type=search]{flex:1;min-width:180px}
+button{font:inherit;border:1px solid var(--line);background:var(--card);color:var(--ink);border-radius:8px;padding:8px 14px;cursor:pointer}
+button.primary{background:var(--acc);border-color:var(--acc);color:#fff;font-weight:600}
+button.small{padding:2px 9px;font-size:13px}
+button.danger{color:var(--bad)}
+button:disabled{opacity:.5;cursor:default}
+.list{border:1px solid var(--line);border-radius:8px;max-height:230px;overflow:auto;margin-top:10px}
+.list>div{padding:7px 12px;border-bottom:1px solid var(--line);cursor:pointer}.list>div:last-child{border:0}
+.list>div:hover{background:var(--acc2)}
+.badge{display:inline-block;font-size:12px;padding:2px 8px;border-radius:99px;background:var(--acc2);color:var(--acc);margin-left:6px}
+.badge.bad{color:var(--bad);background:transparent;border:1px solid var(--bad)}
+label.opt{display:flex;gap:8px;align-items:flex-start;margin:8px 0;cursor:pointer}label.opt small{color:var(--mute);display:block}
+.bar{height:10px;background:var(--bg);border:1px solid var(--line);border-radius:99px;overflow:hidden;margin:10px 0 6px}
+.bar>i{display:block;height:100%;width:0;background:var(--acc);transition:width .3s}
+.stat{color:var(--mute);font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+pre{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:10px;max-height:260px;overflow:auto;font-size:12.5px;margin:10px 0 0;white-space:pre-wrap}
+.err{color:var(--bad);margin-top:8px}
+.tabs{display:flex;gap:4px;margin:0 0 16px;border-bottom:1px solid var(--line)}
+.tabs button{border:0;border-bottom:2px solid transparent;border-radius:0;background:none;color:var(--mute);padding:10px 14px}
+.tabs button.on{color:var(--ink);border-bottom-color:var(--acc);font-weight:600}
+.tab{display:none}.tab.on{display:block}
+.cols{display:grid;grid-template-columns:3fr 2fr;gap:16px;align-items:start}
+@media (max-width:760px){.cols{grid-template-columns:1fr}}
+.scroll{max-height:520px;overflow:auto;margin-top:10px;border:1px solid var(--line);border-radius:8px}
+details{border-bottom:1px solid var(--line)}details:last-child{border:0}
+summary{padding:8px 12px;cursor:pointer;display:flex;gap:8px;align-items:baseline}
+summary b{font-weight:600}summary span{color:var(--mute);font-size:13px}
+.song{display:flex;gap:8px;align-items:center;padding:5px 12px 5px 26px;font-size:14px}
+.song:hover{background:var(--acc2)}
+.song .t{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.song .d{color:var(--mute);font-size:12.5px}
+table{width:100%;border-collapse:collapse;font-size:13.5px}
+td,th{padding:5px 8px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
+th{color:var(--mute);font-weight:600;font-size:12.5px}
+td.path{color:var(--mute);word-break:break-all}
+.st-copy{color:var(--acc)}.st-exists,.st-duplicate{color:var(--mute)}.st-unsupported,.st-unreadable{color:var(--bad)}
+.empty{color:var(--mute);padding:12px}
+</style></head><body><main>
+<h1>Voice Studio</h1>
+<p class="sub">Builds the player's music library and natural voice clips on your PC, then you put the SD card back in the player.</p>
+
+<div class="card"><h2>SD card</h2>
+  <div class="row"><input type="text" id="card-path" placeholder="Folder that contains Music, e.g. E:\">
+    <button id="card-go">Open</button><button id="card-up">Up</button><button id="card-use" class="primary">Use this folder</button></div>
+  <div id="card-info" class="stat" style="margin-top:8px"></div>
+  <div class="list" id="card-dirs"></div>
+</div>
+
+<nav class="tabs">
+  <button data-tab="build" class="on">Build</button>
+  <button data-tab="add">Add music</button>
+  <button data-tab="lib">Library &amp; playlists</button>
+</nav>
+
+<section class="tab on" id="tab-build">
+<div class="card"><h2>Voice</h2>
+  <div class="row"><select id="voice"></select>
+    <label>Speed <select id="speed"><option value="0.8">Fast</option><option value="0.9">A bit fast</option><option value="1.0" selected>Normal</option><option value="1.15">Slow</option></select></label></div>
+  <div class="row" style="margin-top:10px"><input type="text" id="sample" value="Now playing. Albums. Artists. Bjørn Eidsvåg.">
+    <button id="preview">Listen</button></div>
+  <audio id="audio" controls style="width:100%;margin-top:10px;display:none"></audio>
+  <div id="perr" class="err"></div>
+</div>
+
+<div class="card"><h2>Build</h2>
+  <label class="opt"><input type="checkbox" id="quick" checked><span>Quick scan<small>Only read songs that are new or changed since the last library.json.</small></span></label>
+  <label class="opt"><input type="checkbox" id="regen"><span>Remake all voice clips<small>Normally only missing clips, robotic ones and clips from another voice or speed are made.</small></span></label>
+  <label class="opt"><input type="checkbox" id="cleanup"><span>Delete unused song clips<small>Removes clips for songs that are no longer on the card.</small></span></label>
+  <label class="opt"><input type="checkbox" id="menuonly"><span>Menu voices only<small>Just the menu clips, no library scan.</small></span></label>
+  <div class="row" style="margin-top:12px"><button id="start" class="primary">Build</button></div>
+</div>
+</section>
+
+<section class="tab" id="tab-add">
+<div class="card"><h2>Folder with your songs</h2>
+  <p class="stat" style="white-space:normal;margin:0 0 10px">FLAC and MP3 files are copied to <code>Music/Album artist/Album/</code> using their tags (folder names fill in missing tags). Songs already on the card are skipped. Then the library and voice clips are built with the voice from the Build tab.</p>
+  <div class="row"><input type="text" id="src-path" placeholder="e.g. C:\Users\me\Music\New album">
+    <button id="src-go">Open</button><button id="src-up">Up</button><button id="src-use" class="primary">Use this folder</button></div>
+  <div id="src-info" class="stat" style="margin-top:8px"></div>
+  <div class="list" id="src-dirs"></div>
+</div>
+<div class="card"><h2>Copy to the card</h2>
+  <div class="row"><button id="imp-preview">Check songs</button><button id="imp-start" class="primary" disabled>Copy and build</button>
+    <span class="stat" id="imp-sum"></span></div>
+  <div id="imp-err" class="err"></div>
+  <div class="scroll" id="imp-list" style="display:none"></div>
+</div>
+</section>
+
+<section class="tab" id="tab-lib">
+<div class="cols">
+  <div class="card"><h2>On the card</h2>
+    <div class="row"><input type="search" id="q" placeholder="Search songs, albums, artists"><button id="lib-reload">Reload</button></div>
+    <div class="stat" id="lib-info" style="margin-top:8px"></div>
+    <div class="scroll" id="lib-list"></div>
+    <div class="row" style="margin-top:10px"><button id="lib-delete" class="danger" disabled>Delete selected songs</button></div>
+    <div id="lib-err" class="err"></div>
+  </div>
+  <div class="card"><h2>Playlist</h2>
+    <div class="row"><select id="pl-pick" style="flex:1"></select><button id="pl-new">New</button></div>
+    <div class="row" style="margin-top:10px"><input type="text" id="pl-name" placeholder="Playlist name"></div>
+    <div class="stat" style="margin-top:8px">Press <b>+</b> next to a song to add it.</div>
+    <div class="scroll" id="pl-songs" style="max-height:380px"></div>
+    <div class="row" style="margin-top:10px"><button id="pl-save" class="primary">Save playlist</button><button id="pl-del" class="danger">Delete</button></div>
+    <div id="pl-err" class="err"></div>
+  </div>
+</div>
+</section>
+
+<div class="card"><h2>Progress</h2>
+  <div class="row"><div class="bar" style="flex:1;margin:0"><i id="fill"></i></div><button id="cancel" disabled>Cancel</button></div>
+  <div class="stat" id="status" style="margin-top:6px">Idle</div>
+  <div id="serr" class="err"></div>
+  <pre id="log"></pre>
+</div>
+</main>
+<script>
+const $=id=>document.getElementById(id);
+const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const store={get(k){try{return localStorage.getItem(k)}catch(e){return null}},set(k,v){try{localStorage.setItem(k,v)}catch(e){}}};
+let chosen=store.get("vs_root")||"", srcChosen=store.get("vs_src")||"";
+const root=()=>chosen||card.cur;
+
+async function api(url,body){
+  const r=await fetch(url,body===undefined?{}:{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+  const d=await r.json().catch(()=>({error:"Bad answer from Voice Studio"}));
+  if(!r.ok)throw new Error(d.error||r.statusText);
+  return d;
+}
+const voiceOpts=()=>({voice:$("voice").value,speed:$("speed").value,root:root()});
+
+// ---- folder browsers (SD card and import source)
+function browser(prefix,onUse,info){
+  const b={cur:"",parent:null};
+  b.ls=async p=>{
+    const r=await fetch("/api/ls?path="+encodeURIComponent(p)); const d=await r.json();
+    if(d.error){$(prefix+"-info").textContent=d.error;return}
+    b.cur=d.path; b.parent=d.parent; $(prefix+"-path").value=d.path;
+    $(prefix+"-dirs").innerHTML="";
+    d.dirs.forEach(n=>{const e=document.createElement("div");e.textContent=n;
+      e.onclick=()=>b.ls(d.isRoot?n:(d.path.replace(/[\\/]+$/,"")+(d.path.includes("\\")?"\\":"/")+n));$(prefix+"-dirs").appendChild(e)});
+    $(prefix+"-info").innerHTML=d.isRoot?"Choose a drive":info(d);
+    $(prefix+"-up").disabled=b.parent===null;
+  };
+  $(prefix+"-go").onclick=()=>b.ls($(prefix+"-path").value);
+  $(prefix+"-path").onkeydown=e=>{if(e.key==="Enter")b.ls($(prefix+"-path").value)};
+  $(prefix+"-up").onclick=()=>b.ls(b.parent??"");
+  $(prefix+"-use").onclick=()=>onUse(b.cur);
+  return b;
+}
+const card=browser("card",p=>{chosen=p;store.set("vs_root",p);$("card-info").innerHTML="Using "+esc(p)+'<span class="badge">selected</span>';libDirty=true;if(curTab==="lib")loadLib()},
+  d=>d.hasMusic?'Music folder found<span class="badge">ready</span>'+(d.hasLibrary?'<span class="badge">has library.json</span>':''):'No Music folder here<span class="badge bad">not the SD root</span>');
+const src=browser("src",p=>{srcChosen=p;store.set("vs_src",p);$("src-info").innerHTML="Adding from "+esc(p)+'<span class="badge">selected</span>';$("imp-start").disabled=true},
+  d=>"Open the folder with your songs, then press Use this folder");
+
+// ---- tabs
+let curTab="build", libDirty=true;
+document.querySelectorAll(".tabs button").forEach(b=>b.onclick=()=>{
+  curTab=b.dataset.tab;
+  document.querySelectorAll(".tabs button").forEach(x=>x.classList.toggle("on",x===b));
+  document.querySelectorAll(".tab").forEach(x=>x.classList.toggle("on",x.id==="tab-"+curTab));
+  if(curTab==="lib"&&libDirty)loadLib();
+});
+
+// ---- voice + build
+async function voices(){const v=await (await fetch("/api/voices")).json();
+  $("voice").innerHTML=v.map(x=>`<option value="${esc(x.id)}">${esc(x.label)}${x.downloaded?"":"  (downloads)"}</option>`).join("");
+  const s=store.get("vs_voice"); if(s)$("voice").value=s;
+  const sp=store.get("vs_speed"); if(sp)$("speed").value=sp;}
+$("voice").onchange=()=>store.set("vs_voice",$("voice").value);
+$("speed").onchange=()=>store.set("vs_speed",$("speed").value);
+$("preview").onclick=async()=>{$("perr").textContent="";$("preview").disabled=true;$("preview").textContent="Making...";
+  try{const r=await fetch("/api/preview",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({voice:$("voice").value,speed:$("speed").value,text:$("sample").value})});
+    if(!r.ok){$("perr").textContent=(await r.json()).error;return}
+    const a=$("audio");a.src=URL.createObjectURL(await r.blob());a.style.display="block";a.play();voices();}
+  finally{$("preview").disabled=false;$("preview").textContent="Listen"}};
+async function job(url,body,errEl){
+  $("serr").textContent="";if(errEl)$(errEl).textContent="";
+  try{const d=await api(url,body);poll();return d}catch(e){$(errEl||"serr").textContent=e.message;return null}
+}
+$("start").onclick=()=>job("/api/start",{...voiceOpts(),quick:$("quick").checked,regen:$("regen").checked,
+  cleanup:$("cleanup").checked,menu_only:$("menuonly").checked});
+$("cancel").onclick=()=>fetch("/api/cancel",{method:"POST"});
+
+// ---- add music
+const STATUS={copy:"will copy",exists:"already on the card",duplicate:"duplicate (already in the library)",unsupported:"format not supported",unreadable:"could not read"};
+$("imp-preview").onclick=async()=>{
+  $("imp-err").textContent="";$("imp-sum").textContent="Checking...";$("imp-start").disabled=true;
+  try{
+    const d=await api("/api/import/preview?root="+encodeURIComponent(root())+"&src="+encodeURIComponent(srcChosen||src.cur));
+    const c=d.counts;
+    $("imp-sum").textContent=`${c.copy||0} to copy`+Object.keys(c).filter(k=>k!=="copy").map(k=>`, ${c[k]} ${STATUS[k]}`).join("");
+    $("imp-list").style.display="block";
+    $("imp-list").innerHTML=d.items.length?`<table><tr><th>Song</th><th>Goes to</th><th></th></tr>`+d.items.map(it=>
+      `<tr><td>${esc(it.title)}<br><span class="stat">${esc(it.artist)}${it.album?" · "+esc(it.album):""}</span></td>`+
+      `<td class="path">${esc(it.target||it.src)}</td><td class="st-${it.status}">${STATUS[it.status]}</td></tr>`).join("")+"</table>"
+      :'<div class="empty">No FLAC or MP3 files in that folder.</div>';
+    $("imp-start").disabled=!c.copy;
+  }catch(e){$("imp-sum").textContent="";$("imp-err").textContent=e.message}
+};
+$("imp-start").onclick=async()=>{
+  if(await job("/api/import/start",{...voiceOpts(),src:srcChosen||src.cur},"imp-err")){$("imp-start").disabled=true;libDirty=true}
+};
+
+// ---- library + playlists
+let lib={albums:[]}, playlists=[], pl={name:"",oldName:null,paths:[]}, plDirty=false;
+const byPath=new Map(), selected=new Set();
+const fmt=s=>Math.floor(s/60)+":"+String(s%60).padStart(2,"0");
+async function loadLib(){
+  if(!root()){$("lib-info").textContent="Choose the SD card first.";return}
+  $("lib-err").textContent="";$("lib-info").textContent="Loading...";
+  try{
+    [lib,playlists]=await Promise.all([api("/api/library?root="+encodeURIComponent(root())),api("/api/playlists?root="+encodeURIComponent(root()))]);
+  }catch(e){$("lib-info").textContent="";$("lib-err").textContent=e.message;return}
+  libDirty=false; byPath.clear(); selected.clear();
+  lib.albums.forEach(a=>a.tracks.forEach(t=>byPath.set(t.path,t)));
+  const n=byPath.size;
+  $("lib-info").innerHTML=!lib.hasLibrary?'No library.json yet <span class="badge bad">run Build first</span>'
+    :`${lib.albums.length} albums, ${n} songs`+(lib.missing?`<span class="badge bad">${lib.missing} voice clips missing: run Build</span>`:'<span class="badge">all clips made</span>');
+  renderLib(); renderPick();
+  const keep=playlists.find(p=>p.name===pl.oldName);
+  if(!plDirty)openPlaylist(keep||playlists[0]||null);
+}
+function renderLib(){
+  const q=$("q").value.trim().toLowerCase();
+  const hit=s=>s&&s.toLowerCase().includes(q);
+  const html=lib.albums.map(a=>{
+    const albumHit=!q||hit(a.name)||hit(a.artist);
+    const ts=a.tracks.filter(t=>albumHit||hit(t.title)||hit(t.artist));
+    if(!ts.length)return "";
+    return `<details${q?" open":""}><summary><b>${esc(a.name)}</b><span>${esc(a.artist)}${a.year?" · "+a.year:""}</span>`+
+      (a.missingClip?'<span class="badge bad">no clip</span>':"")+`</summary>`+
+      ts.map(t=>`<div class="song"><input type="checkbox" data-sel="${esc(t.path)}"${selected.has(t.path)?" checked":""}>`+
+        `<span class="t" title="${esc(t.path)}">${esc(t.title)}</span>`+(t.missingClip?'<span class="badge bad">no clip</span>':"")+
+        `<span class="d">${fmt(t.duration)}</span><button class="small" data-add="${esc(t.path)}" title="Add to playlist">+</button></div>`).join("")+
+      `</details>`;
+  }).join("");
+  $("lib-list").innerHTML=html||`<div class="empty">${lib.hasLibrary?"Nothing found.":"Nothing here yet."}</div>`;
+}
+$("q").oninput=renderLib;
+$("lib-reload").onclick=loadLib;
+$("lib-list").onclick=e=>{
+  const add=e.target.dataset.add, sel=e.target.dataset.sel;
+  if(add){pl.paths.push(add);plDirty=true;renderPl()}
+  if(sel!==undefined){e.target.checked?selected.add(sel):selected.delete(sel);$("lib-delete").disabled=!selected.size;
+    $("lib-delete").textContent=selected.size?`Delete ${selected.size} selected song${selected.size>1?"s":""}`:"Delete selected songs"}
+};
+$("lib-delete").onclick=async()=>{
+  if(!selected.size||!confirm(`Delete ${selected.size} song(s) from the SD card? This removes the files.`))return;
+  if(await job("/api/library/delete",{...voiceOpts(),paths:[...selected]},"lib-err")){selected.clear();$("lib-delete").disabled=true;libDirty=true}
+};
+function renderPick(){
+  $("pl-pick").innerHTML=`<option value="">${playlists.length?"Choose a playlist":"No playlists yet"}</option>`+
+    playlists.map((p,i)=>`<option value="${i}">${esc(p.name)} (${p.paths.length})</option>`).join("");
+  const i=playlists.findIndex(p=>p.name===pl.oldName); $("pl-pick").value=i>=0?i:"";
+}
+function openPlaylist(p){
+  pl=p?{name:p.name,oldName:p.name,paths:[...p.paths]}:{name:"",oldName:null,paths:[]};
+  plDirty=false; $("pl-name").value=pl.name; renderPick(); renderPl();
+}
+function renderPl(){
+  $("pl-del").disabled=!pl.oldName;
+  $("pl-songs").innerHTML=pl.paths.length?pl.paths.map((p,i)=>{const t=byPath.get(p);
+    return `<div class="song" style="padding-left:12px"><span class="d">${i+1}</span><span class="t" title="${esc(p)}">${t?esc(t.title):'<s>'+esc(p)+'</s> <span class="badge bad">not on the card</span>'}</span>`+
+      `<button class="small" data-mv="${i}" data-d="-1" title="Up">↑</button><button class="small" data-mv="${i}" data-d="1" title="Down">↓</button>`+
+      `<button class="small danger" data-rm="${i}" title="Remove">×</button></div>`}).join("")
+    :'<div class="empty">Empty. Add songs with + in the list.</div>';
+}
+$("pl-songs").onclick=e=>{
+  const d=e.target.dataset;
+  if(d.rm!==undefined){pl.paths.splice(+d.rm,1)}
+  else if(d.mv!==undefined){const i=+d.mv,j=i+(+d.d);if(j<0||j>=pl.paths.length)return;[pl.paths[i],pl.paths[j]]=[pl.paths[j],pl.paths[i]]}
+  else return;
+  plDirty=true;renderPl();
+};
+$("pl-name").oninput=()=>{pl.name=$("pl-name").value;plDirty=true};
+$("pl-pick").onchange=()=>{
+  if(plDirty&&!confirm("Discard the changes to this playlist?")){renderPick();return}
+  const v=$("pl-pick").value; openPlaylist(v===""?null:playlists[+v]);
+};
+$("pl-new").onclick=()=>{if(plDirty&&!confirm("Discard the changes to this playlist?"))return;openPlaylist(null);$("pl-name").focus()};
+$("pl-save").onclick=async()=>{
+  const name=$("pl-name").value.trim();
+  if(!name){$("pl-err").textContent="Give the playlist a name.";return}
+  const d=await job("/api/playlists/save",{...voiceOpts(),name,oldName:pl.oldName,paths:pl.paths},"pl-err");
+  if(d){pl.oldName=pl.name=d.name;$("pl-name").value=d.name;plDirty=false;libDirty=true}
+};
+$("pl-del").onclick=async()=>{
+  if(!pl.oldName||!confirm(`Delete the playlist "${pl.oldName}"? The songs stay on the card.`))return;
+  if(await job("/api/playlists/delete",{...voiceOpts(),name:pl.oldName},"pl-err")){openPlaylist(null);libDirty=true}
+};
+
+// ---- progress
+let polling=false;
+async function poll(){
+  if(polling)return; polling=true;
+  try{
+    for(;;){
+      const s=await (await fetch("/api/status")).json();
+      document.querySelectorAll("#start,#imp-preview,#pl-save,#pl-del,#lib-delete").forEach(b=>{
+        if(s.running)b.disabled=true; else if(b.id==="start"||b.id==="imp-preview"||b.id==="pl-save")b.disabled=false;});
+      if(!s.running){$("pl-del").disabled=!pl.oldName;$("lib-delete").disabled=!selected.size}
+      $("cancel").disabled=!s.running;
+      const pct=s.total?Math.round(100*s.done/s.total):(s.running?5:(s.result?100:0));
+      $("fill").style.width=pct+"%";
+      let eta=""; if(s.running&&s.total&&s.done>5&&s.stage==="Voices"){eta="  ~"+fmt(Math.round(s.elapsed/s.done*(s.total-s.done)))+" left"}
+      $("status").textContent=s.stage+(s.total?` ${s.done}/${s.total}`:(s.done?` ${s.done} files`:""))+(s.item?"  "+s.item:"")+eta;
+      $("log").textContent=s.log.join("\n");$("log").scrollTop=1e9;
+      if(s.error&&s.error!=="cancelled")$("serr").textContent=s.error;
+      if(!s.running){if(s.stage==="Finished"){libDirty=true;if(curTab==="lib")loadLib()}break}
+      await new Promise(r=>setTimeout(r,500));
+    }
+  }finally{polling=false}
+}
+card.ls(chosen||"");src.ls(srcChosen||"");voices();poll();
+</script></body></html>

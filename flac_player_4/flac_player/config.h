@@ -29,15 +29,21 @@
 #define PIN_LED_GREEN   38           // LED1: on while the player is on
 #define PIN_LED_PURPLE  39           // LED2: not used yet, kept off
 #define PIN_LED_ORANGE  40           // LED3: charging
-#define PIN_LED_BLUE    41           // LED4: not used yet, kept off
+#define PIN_LED_BLUE    41           // LED4: battery above 60 % (needs PIN_BAT_ADC)
 #define PIN_LED_RED     42           // LED5: low battery (needs PIN_BAT_ADC)
 #define LED_ACTIVE_HIGH 1            // 1 = pin HIGH lights the LED
 
-// Battery sense: ADC pin on a divider from the battery (-1 = none, red LED stays off).
-// The board has none yet; GPIO 8 is free and ADC-capable (2 x 100k divider + 100 nF to GND).
+// Battery sense: ADC pin on a divider from the battery (-1 = none).
+// The board has none yet; GPIO 8 is free and ADC-capable: 1M from BAT+ to GPIO 8, 1M from
+// GPIO 8 to GND, 100 nF from GPIO 8 to GND (draws ~2 uA, so it doesn't drain the battery).
+// Without it the red LED, LED4, Settings > Battery and the low-battery warnings stay off.
 #define PIN_BAT_ADC     -1
+#define HAS_BATTERY     (PIN_BAT_ADC >= 0)
 #define BAT_DIVIDER     2.0f         // battery volts / pin volts (2.0 for two equal resistors)
 #define BAT_LOW_V       3.45f        // red LED below this
+#define BAT_LED4_PCT    60           // LED4 on above this
+#define BAT_WARN_PCT    15           // says "Battery low" once
+#define BAT_CRIT_PCT    3            // says "Battery critical" and powers off
 
 // Power button holds
 #define POWER_OFF_HOLD_MS  3000      // hold Home this long to power off
@@ -56,6 +62,7 @@
 #define SYSTEM_DIR      "/System"
 #define LIBRARY_JSON    "/System/library.json"
 #define STATE_JSON      "/System/state.json"
+#define PLAYLIST_DIR    "/Playlists"   // <name>.m3u8, one /Music/... path per line (made by Voice Studio)
 
 // ---------- Audio ----------
 #define READ_AHEAD_BYTES   (32 * 1024)   // per track, lives in PSRAM

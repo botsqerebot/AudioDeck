@@ -40,7 +40,11 @@ static const MenuVoice MENU_VOICES[] = {
   {"fade_on", "Soft fade on"}, {"fade_off", "Soft fade off"},
   {"voltick_on", "Volume ticks on"}, {"voltick_off", "Volume ticks off"},
   {"chime_on", "Startup chime on"}, {"chime_off", "Startup chime off"},
+  {"music_playlists", "Playlists"},
+  {"charging", "Charging"},
+  {"battery_low", "Battery low."}, {"battery_critical", "Battery critical. Powering off."},
 };
+// Plus "battery_0" .. "battery_100": "Battery N percent" (see Library::batteryVoice, made by Voice Studio)
 static const size_t MENU_VOICE_COUNT = sizeof(MENU_VOICES) / sizeof(MENU_VOICES[0]);
 
 // Accent/case-folding compare without allocating; skips a leading "The "
@@ -67,7 +71,7 @@ public:
   Library() : doc(&spiRamAllocator) {}
 
   bool loaded = false;
-  PVec<JsonObject> tracks, albums, artists, genres;
+  PVec<JsonObject> tracks, albums, artists, genres, playlists;
   PVec<uint16_t> allSongs;
   // Letter Album: first letters that have albums ('a'-'z', then '#' for anything else).
   // The albums of letters[i] are letterAlbums[letterStart[i] .. letterStart[i + 1]).
@@ -89,6 +93,13 @@ public:
     for (size_t i = 0; i < MENU_VOICE_COUNT; i++)
       if (!strcmp(MENU_VOICES[i].key, key)) return VoicePaths::menu(key, MENU_VOICES[i].text);
     return String();
+  }
+
+  // "Battery 73 percent"
+  static String batteryVoice(int pct) {
+    pct = constrain(pct, 0, 100);
+    String key = String("battery_") + pct, text = String("Battery ") + pct + " percent";
+    return VoicePaths::menu(key.c_str(), text.c_str());
   }
 
   // Called at boot: reports menu clips that Voice Studio hasn't made yet
@@ -314,9 +325,14 @@ public:
     JsonObject counts = nd["counts"].to<JsonObject>();
     counts["tracks"] = nT; counts["albums"] = jAlbums.size(); counts["artists"] = jArtists.size(); counts["genres"] = jGenres.size();
 
+    // ---- 4b. playlists: PLAYLIST_DIR/<name>.m3u8 (same rules as Voice Studio) ----
+    JsonArray jPlaylists = nd["playlists"].to<JsonArray>();
+    scanPlaylists(T, jPlaylists);
+    counts["playlists"] = jPlaylists.size();
+
     // ---- 5. voice clip names (same names Voice Studio uses) ----
     const uint32_t nMenu = MENU_VOICE_COUNT;
-    uint32_t total = nMenu + nT + jAlbums.size() + jArtists.size() + jGenres.size(), done = 0;
+    uint32_t total = nMenu + nT + jAlbums.size() + jArtists.size() + jGenres.size() + jPlaylists.size(), done = 0;
     JsonObject mv = nd["menuVoices"].to<JsonObject>();
     for (size_t i = 0; i < MENU_VOICE_COUNT; i++) {
       mv[MENU_VOICES[i].key] = VoicePaths::menu(MENU_VOICES[i].key, MENU_VOICES[i].text);
@@ -333,6 +349,7 @@ public:
     for (JsonObject o : jAlbums)  { voiceFor(o, "name", false); if (cb) cb("Voices", ++done, total, str(o, "name")); }
     for (JsonObject o : jArtists) { voiceFor(o, "name", false); if (cb) cb("Voices", ++done, total, str(o, "name")); }
     for (JsonObject o : jGenres)  { voiceFor(o, "name", false); if (cb) cb("Voices", ++done, total, str(o, "name")); }
+    for (JsonObject o : jPlaylists) { voiceFor(o, "name", false); if (cb) cb("Voices", ++done, total, str(o, "name")); }
 
     // ---- 6. save (write tmp, then rename) ----
     if (cb) cb("Saving", 0, 0, "");
@@ -368,8 +385,62 @@ public:
 private:
   JsonDocument doc;
 
+  // A playlist line -> "/Music/..." path: "#" lines and blanks are skipped, "\\" becomes "/",
+  // leading "./" and "../" are dropped and a leading "/" is added
+  static String playlistLine(String line) {
+    line.trim();
+    if (!line.length() || line[0] == '#') return String();
+    line.replace("\\", "/");
+    for (;;) {
+      if (line.startsWith("../")) line.remove(0, 3);
+      else if (line.startsWith("./")) line.remove(0, 2);
+      else break;
+    }
+    if (line[0] != '/') line = "/" + line;
+    return line;
+  }
+
+  void scanPlaylists(PVec<JsonObject> &T, JsonArray out) {
+    struct PL { String name; PVec<uint16_t> ids; };
+    std::vector<PL> pls;
+    fs::File dir = SD.open(PLAYLIST_DIR);
+    if (!dir || !dir.isDirectory()) return;
+    PVec<std::pair<uint64_t, uint16_t>> byPath;
+    for (size_t i = 0; i < T.size(); i++) byPath.push_back({fnv64(String(str(T[i], "path"))), (uint16_t)i});
+    std::sort(byPath.begin(), byPath.end());
+    for (fs::File f = dir.openNextFile(); f; f = dir.openNextFile()) {
+      String name = pathBase(String(f.name())), lower = name;
+      lower.toLowerCase();
+      if (f.isDirectory() || name.startsWith(".") || !(lower.endsWith(".m3u8") || lower.endsWith(".m3u"))) { f.close(); continue; }
+      PL pl;
+      pl.name = name.substring(0, name.lastIndexOf('.'));
+      bool first = true;
+      while (f.available()) {
+        String line = f.readStringUntil('\n');
+        if (first && line.startsWith("\xEF\xBB\xBF")) line.remove(0, 3);    // UTF-8 BOM
+        first = false;
+        String path = playlistLine(line);
+        if (!path.length()) continue;
+        uint64_t h = fnv64(path);
+        auto it = std::lower_bound(byPath.begin(), byPath.end(), std::make_pair(h, (uint16_t)0));
+        for (; it != byPath.end() && it->first == h; ++it)
+          if (path == str(T[it->second], "path")) { pl.ids.push_back(it->second); break; }   // songs no longer on the card are left out
+      }
+      f.close();
+      pls.push_back(std::move(pl));
+    }
+    dir.close();
+    std::sort(pls.begin(), pls.end(), [](const PL &a, const PL &b) { return foldCmp(a.name.c_str(), b.name.c_str()) < 0; });
+    for (PL &pl : pls) {
+      JsonObject o = out.add<JsonObject>();
+      o["name"] = pl.name;
+      JsonArray ids = o["tracks"].to<JsonArray>();
+      for (uint16_t t : pl.ids) ids.add(t);
+    }
+  }
+
   void clearIndex() {
-    tracks.clear(); albums.clear(); artists.clear(); genres.clear(); allSongs.clear();
+    tracks.clear(); albums.clear(); artists.clear(); genres.clear(); playlists.clear(); allSongs.clear();
     letters.clear(); letterStart.clear(); letterAlbums.clear();
   }
 
@@ -379,6 +450,7 @@ private:
     for (JsonObject o : doc["albums"].as<JsonArray>()) albums.push_back(o);
     for (JsonObject o : doc["artists"].as<JsonArray>()) artists.push_back(o);
     for (JsonObject o : doc["genres"].as<JsonArray>()) genres.push_back(o);
+    for (JsonObject o : doc["playlists"].as<JsonArray>()) playlists.push_back(o);   // missing in older files: none
     for (JsonVariant v : doc["allSongs"].as<JsonArray>()) allSongs.push_back(v.as<uint16_t>());
     buildLetters();
   }

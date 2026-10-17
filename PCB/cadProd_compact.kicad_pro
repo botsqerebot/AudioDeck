@@ -754,7 +754,7 @@
         "uuid": "d5db8cdc-b1d0-4ecc-81a1-7fa2992e836c"
       }
     ],
-    "used_designators": "J2,#PWR70-72,ESD7-8",
+    "used_designators": "Digital_Vol1,AnaVol2,R5,R25-27,C19-25,#PWR2,#PWR31-32,#PWR66-67,#PWR70-77,Q1-2,J2,ESD7-8",
     "variants": [
       {
         "name": "Rev2"

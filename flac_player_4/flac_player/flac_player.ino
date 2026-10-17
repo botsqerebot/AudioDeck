@@ -25,16 +25,19 @@ Library library;
 Engine engine(library);
 Menu menu(library, engine);
 
-// Hold Home 3 s: say goodbye, save the resume point, switch everything off, deep sleep
-static void powerOff() {
-  Serial.println("[power] off");
-  engine.speak(library.menuVoice("power_off"), true);
-  delay(1800);
+// Say goodbye, save the resume point, switch everything off, deep sleep
+static void shutdownSaying(const char *clip, uint32_t ms) {
+  Serial.printf("[power] off (%s)\n", clip);
+  engine.speak(library.menuVoice(clip), true);
+  delay(ms);
   engine.stopAll();                    // also saves the resume point
+  engine.shutdown();                   // audio task stops, I2S pins are free to park
   delay(150);
   SD.end();
-  Power::sleepNow();
+  SPI.end();
+  Power::sleepNow();                   // parks the SD and I2S pins, then sleeps
 }
+static void powerOff() { shutdownSaying("power_off", 1800); }   // hold Home 3 s, auto off
 
 static bool startSD() {
   SPI.begin(PIN_SD_CLK, PIN_SD_MISO, PIN_SD_MOSI, PIN_SD_CS);
@@ -95,6 +98,11 @@ void setup() {
 void loop() {
   menu.poll();
   Power::update();
+  switch (Power::lowEvent()) {         // needs PIN_BAT_ADC, otherwise never fires
+    case Power::BAT_LOW: engine.speak(library.menuVoice("battery_low"), true); break;
+    case Power::BAT_CRITICAL: shutdownSaying("battery_critical", 3000); break;
+    default: break;
+  }
   engine.periodicSave();
   delay(5);
 }

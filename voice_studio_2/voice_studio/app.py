@@ -6,9 +6,13 @@ Build. It writes exactly what the player's own scan makes:
     System/library.json, Voices/Menu/*.wav, Voices/Library/*/*.wav
 but with Piper's natural voice instead of the robotic one.
 
+It can also copy songs from a PC folder onto the card (sorted by their tags), show
+what is on the card, and make playlists (Playlists/*.m3u8). The page is static/index.html.
+
 Setup:  pip install flask piper-tts
 Run:    python app.py
 """
+import json
 import os
 import string
 import sys
@@ -17,7 +21,7 @@ import time
 import webbrowser
 from pathlib import Path
 
-from flask import Flask, jsonify, request, Response
+from flask import Flask, jsonify, request, send_from_directory
 
 import fpbuilder as fb
 
@@ -69,14 +73,31 @@ def progress(stage, done, total, item):
         job.update(stage=stage, done=done, total=total, item=item)
 
 
-def run_job(opts):
+def do_build(tts, opts):
+    return fb.build(opts["root"], tts, quick=opts.get("quick", True), menu_items=menu_items(),
+                    regen=opts.get("regen", False), cleanup=opts.get("cleanup", False),
+                    menu_only=opts.get("menu_only", False), progress=progress, log=log, cancel=lambda: job["cancel"])
+
+
+def do_import(tts, opts):
+    items = fb.plan_import(opts["root"], opts["src"])
+    skipped = sum(it["status"] != "copy" for it in items)
+    if skipped:
+        log(f"Skipping {skipped} files (already on the card, duplicates or unsupported)")
+    fb.copy_import(opts["root"], items, progress=progress, log=log, cancel=lambda: job["cancel"])
+    return do_build(tts, opts)
+
+
+def do_playlists(tts, opts):
+    return fb.update_playlists(opts["root"], tts, progress=progress, log=log, cancel=lambda: job["cancel"])
+
+
+def run_job(work, opts):
     try:
         log(f"Loading voice {opts['voice']} (first time downloads ~60 MB)...")
         tts = get_tts(opts["voice"], opts["speed"])
         with tts_lock:
-            res = fb.build(opts["root"], tts, quick=opts["quick"], menu_items=menu_items(),
-                           regen=opts["regen"], cleanup=opts["cleanup"], menu_only=opts["menu_only"],
-                           progress=progress, log=log, cancel=lambda: job["cancel"])
+            res = work(tts, opts)
         took = int(time.time() - job["started"])
         log(f"Done in {took // 60} min {took % 60} s: {res.get('made', 0)} clips made, "
             f"{res.get('kept', 0)} already up to date.")
@@ -140,24 +161,181 @@ def api_preview():
     return Response(wav, mimetype="audio/wav")
 
 
+class BadRequest(Exception):
+    pass
+
+
+@app.errorhandler(BadRequest)
+def bad_request(e):
+    return jsonify(error=str(e)), 400
+
+
+def card_root(root, need_music=True):
+    """The chosen SD card folder, checked."""
+    root = (root or "").strip()
+    if not root or not Path(root).is_dir():
+        raise BadRequest("Choose the SD card folder first.")
+    if need_music and not (Path(root) / "Music").is_dir():
+        raise BadRequest('That folder has no "Music" folder inside. Choose the SD card root.')
+    return Path(root)
+
+
+def inside(base, rel):
+    """<base>/<rel>, refusing anything that escapes base."""
+    p = (base / rel.lstrip("/")).resolve()
+    if not p.is_relative_to(base.resolve()):
+        raise BadRequest("Path is outside the card.")
+    return p
+
+
+def start_job(work, d, note=None, reply=None, **extra):
+    """Run work(tts, opts) in the background; the page follows it with /api/status."""
+    with job_lock:
+        if job["running"]:
+            return jsonify(error="Already running. Wait for it to finish or cancel it."), 409
+        job.update(running=True, stage="Starting", done=0, total=0, item="", log=[], result=None,
+                   error=None, cancel=False, started=time.time())
+    if note:
+        log(note)
+    opts = dict(voice=d.get("voice") or SUGGESTED[0][0], speed=float(d.get("speed", 1.0)), **extra)
+    threading.Thread(target=run_job, args=(work, opts), daemon=True).start()
+    return jsonify(ok=True, **(reply or {}))
+
+
 @app.post("/api/start")
 def api_start():
     d = request.get_json(force=True)
-    root = (d.get("root") or "").strip()
-    if not root or not Path(root).is_dir():
-        return jsonify(error="Choose the SD card folder first."), 400
-    if not d.get("menu_only") and not (Path(root) / "Music").is_dir():
-        return jsonify(error='That folder has no "Music" folder inside. Choose the SD card root.'), 400
+    root = card_root(d.get("root"), need_music=not d.get("menu_only"))
+    return start_job(do_build, d, root=str(root), quick=bool(d.get("quick", True)), regen=bool(d.get("regen")),
+                     cleanup=bool(d.get("cleanup")), menu_only=bool(d.get("menu_only")))
+
+
+# ---- add music from a PC folder
+def import_src(root, src):
+    src = Path((src or "").strip())
+    if not src.is_dir():
+        raise BadRequest("Choose the folder with your songs.")
+    music = (root / "Music").resolve()
+    s = src.resolve()
+    if s == music or s.is_relative_to(music) or music.is_relative_to(s):
+        raise BadRequest("Choose a folder outside the SD card's Music folder.")
+    return src
+
+
+@app.get("/api/import/preview")
+def api_import_preview():
+    root = card_root(request.args.get("root"))
+    src = import_src(root, request.args.get("src"))
+    items = fb.plan_import(root, src)
+    counts = {}
+    for it in items:
+        counts[it["status"]] = counts.get(it["status"], 0) + 1
+    return jsonify(items=items, counts=counts)
+
+
+@app.post("/api/import/start")
+def api_import_start():
+    d = request.get_json(force=True)
+    root = card_root(d.get("root"))
+    src = import_src(root, d.get("src"))
+    return start_job(do_import, d, root=str(root), src=str(src), quick=True)
+
+
+# ---- library on the card
+@app.get("/api/library")
+def api_library():
+    root = card_root(request.args.get("root"))
+    try:
+        lib = json.loads((root / fb.LIBRARY_JSON.lstrip("/")).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return jsonify(albums=[], playlists=[], missing=0, hasLibrary=False)
+    tracks = lib.get("tracks", [])
+    missing = 0
+
+    def gone(o):
+        nonlocal missing
+        v = o.get("voice")
+        m = not v or not (root / v.lstrip("/")).exists()
+        missing += m
+        return m
+
+    albums = []
+    for a in lib.get("albums", []):
+        albums.append({"name": a["name"], "artist": a.get("artist", ""), "year": a.get("year", 0),
+                       "missingClip": gone(a),
+                       "tracks": [{"title": tracks[i]["title"], "artist": tracks[i].get("artist", ""),
+                                   "duration": tracks[i].get("duration", 0), "path": tracks[i]["path"],
+                                   "missingClip": gone(tracks[i])} for i in a.get("tracks", [])]})
+    for o in lib.get("artists", []) + lib.get("genres", []) + lib.get("playlists", []):
+        gone(o)
+    return jsonify(albums=albums, missing=missing, hasLibrary=True)
+
+
+@app.post("/api/library/delete")
+def api_library_delete():
+    d = request.get_json(force=True)
+    root = card_root(d.get("root"))
+    music = (root / "Music").resolve()
+    paths = d.get("paths") or []
+    for rel in paths:
+        if not rel.lower().endswith(fb.AUDIO_EXTS):
+            raise BadRequest(f"Not a song: {rel}")
+        p = inside(music.parent, rel)
+        if not p.is_relative_to(music):
+            raise BadRequest("Only songs in Music can be deleted.")
     with job_lock:
         if job["running"]:
-            return jsonify(error="Already running."), 409
-        job.update(running=True, stage="Starting", done=0, total=0, item="", log=[], result=None,
-                   error=None, cancel=False, started=time.time())
-    opts = dict(root=root, voice=d.get("voice") or SUGGESTED[0][0], speed=float(d.get("speed", 1.0)),
-                quick=bool(d.get("quick", True)), regen=bool(d.get("regen")), cleanup=bool(d.get("cleanup")),
-                menu_only=bool(d.get("menu_only")))
-    threading.Thread(target=run_job, args=(opts,), daemon=True).start()
-    return jsonify(ok=True)
+            return jsonify(error="Already running. Wait for it to finish or cancel it."), 409
+    removed = 0
+    for rel in paths:
+        p = inside(music.parent, rel)
+        if p.is_file():
+            p.unlink()
+            removed += 1
+            for parent in p.parents:                     # drop folders left empty
+                if parent == music or parent == music.parent:
+                    break
+                try:
+                    parent.rmdir()
+                except OSError:
+                    break
+    return start_job(do_build, d, note=f"Deleted {removed} songs", root=str(root), quick=True)
+
+
+# ---- playlists
+@app.get("/api/playlists")
+def api_playlists():
+    root = card_root(request.args.get("root"))
+    out = [dict(zip(("name", "paths"), fb.read_playlist(f))) for f in fb.playlist_files(root)]
+    out.sort(key=lambda p: fb.fold_key(p["name"]))
+    return jsonify(out)
+
+
+@app.post("/api/playlists/save")
+def api_playlists_save():
+    d = request.get_json(force=True)
+    root = card_root(d.get("root"))
+    name = (d.get("name") or "").strip()
+    if not name:
+        raise BadRequest("Give the playlist a name.")
+    paths = [p for p in (d.get("paths") or []) if isinstance(p, str) and p.startswith("/Music/")]
+    with job_lock:
+        if job["running"]:
+            return jsonify(error="Already running. Wait for it to finish or cancel it."), 409
+    used = fb.save_playlist(root, name, paths, old_name=d.get("oldName"))
+    return start_job(do_playlists, d, note=f"Saved playlist {used} ({len(paths)} songs)",
+                     reply={"name": used}, root=str(root))
+
+
+@app.post("/api/playlists/delete")
+def api_playlists_delete():
+    d = request.get_json(force=True)
+    root = card_root(d.get("root"))
+    with job_lock:
+        if job["running"]:
+            return jsonify(error="Already running. Wait for it to finish or cancel it."), 409
+    fb.delete_playlist(root, d.get("name") or "")
+    return start_job(do_playlists, d, note=f"Deleted playlist {d.get('name')}", root=str(root))
 
 
 @app.post("/api/cancel")
@@ -177,116 +355,7 @@ def api_status():
 
 @app.get("/")
 def index():
-    return Response(PAGE, mimetype="text/html")
-
-
-PAGE = r"""<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Voice Studio</title>
-<style>
-:root{--bg:#f6f5f2;--card:#fff;--ink:#1d1d1f;--mute:#6b6b70;--line:#e3e1dc;--acc:#2f6f5e;--acc2:#e8f1ee;--bad:#b3261e}
-@media (prefers-color-scheme:dark){:root{--bg:#141414;--card:#1e1e1e;--ink:#eee;--mute:#9a9a9a;--line:#333;--acc:#5fb39b;--acc2:#1f2d29;--bad:#ff8a80}}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.45 system-ui,-apple-system,Segoe UI,sans-serif}
-main{max-width:860px;margin:0 auto;padding:28px 16px 60px}
-h1{font-size:22px;margin:0 0 4px}p.sub{color:var(--mute);margin:0 0 22px}
-.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:18px;margin-bottom:16px}
-.card h2{font-size:13px;letter-spacing:.06em;text-transform:uppercase;color:var(--mute);margin:0 0 12px}
-.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
-input[type=text],select{font:inherit;color:inherit;background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:8px 10px}
-input[type=text]{flex:1;min-width:200px}
-button{font:inherit;border:1px solid var(--line);background:var(--card);color:var(--ink);border-radius:8px;padding:8px 14px;cursor:pointer}
-button.primary{background:var(--acc);border-color:var(--acc);color:#fff;font-weight:600}
-button:disabled{opacity:.5;cursor:default}
-.list{border:1px solid var(--line);border-radius:8px;max-height:230px;overflow:auto;margin-top:10px}
-.list div{padding:7px 12px;border-bottom:1px solid var(--line);cursor:pointer}.list div:last-child{border:0}
-.list div:hover{background:var(--acc2)}
-.badge{display:inline-block;font-size:12px;padding:2px 8px;border-radius:99px;background:var(--acc2);color:var(--acc);margin-left:6px}
-.badge.bad{color:var(--bad);background:transparent;border:1px solid var(--bad)}
-label.opt{display:flex;gap:8px;align-items:flex-start;margin:8px 0;cursor:pointer}label.opt small{color:var(--mute);display:block}
-.bar{height:10px;background:var(--bg);border:1px solid var(--line);border-radius:99px;overflow:hidden;margin:10px 0 6px}
-.bar>i{display:block;height:100%;width:0;background:var(--acc);transition:width .3s}
-.stat{color:var(--mute);font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-pre{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:10px;max-height:260px;overflow:auto;font-size:12.5px;margin:10px 0 0;white-space:pre-wrap}
-.err{color:var(--bad);margin-top:8px}
-</style></head><body><main>
-<h1>Voice Studio</h1>
-<p class="sub">Builds the player's music library and natural voice clips on your PC, then you put the SD card back in the player.</p>
-
-<div class="card"><h2>1. SD card</h2>
-  <div class="row"><input type="text" id="path" placeholder="Folder that contains Music, e.g. E:\">
-    <button id="go">Open</button><button id="up">Up</button><button id="use" class="primary">Use this folder</button></div>
-  <div id="pathinfo" class="stat" style="margin-top:8px"></div>
-  <div class="list" id="dirs"></div>
-</div>
-
-<div class="card"><h2>2. Voice</h2>
-  <div class="row"><select id="voice"></select>
-    <label>Speed <select id="speed"><option value="0.8">Fast</option><option value="0.9">A bit fast</option><option value="1.0" selected>Normal</option><option value="1.15">Slow</option></select></label></div>
-  <div class="row" style="margin-top:10px"><input type="text" id="sample" value="Now playing. Albums. Artists. Bjørn Eidsvåg.">
-    <button id="preview">Listen</button></div>
-  <audio id="audio" controls style="width:100%;margin-top:10px;display:none"></audio>
-  <div id="perr" class="err"></div>
-</div>
-
-<div class="card"><h2>3. Build</h2>
-  <label class="opt"><input type="checkbox" id="quick" checked><span>Quick scan<small>Only read songs that are new or changed since the last library.json.</small></span></label>
-  <label class="opt"><input type="checkbox" id="regen"><span>Remake all voice clips<small>Normally only missing clips, robotic ones and clips from another voice or speed are made.</small></span></label>
-  <label class="opt"><input type="checkbox" id="cleanup"><span>Delete unused song clips<small>Removes clips for songs that are no longer on the card.</small></span></label>
-  <label class="opt"><input type="checkbox" id="menuonly"><span>Menu voices only<small>Just the menu clips, no library scan.</small></span></label>
-  <div class="row" style="margin-top:12px"><button id="start" class="primary">Build</button><button id="cancel" disabled>Cancel</button></div>
-  <div class="bar"><i id="fill"></i></div>
-  <div class="stat" id="status">Idle</div>
-  <div id="serr" class="err"></div>
-  <pre id="log"></pre>
-</div>
-</main>
-<script>
-const $=id=>document.getElementById(id);
-let cur="", parent=null, chosen=localStorage.getItem("vs_root")||"";
-async function ls(p){
-  const r=await fetch("/api/ls?path="+encodeURIComponent(p)); const d=await r.json();
-  if(d.error){$("pathinfo").textContent=d.error;return}
-  cur=d.path; parent=d.parent; $("path").value=d.path;
-  $("dirs").innerHTML=""; d.dirs.forEach(n=>{const e=document.createElement("div");e.textContent=n;
-    e.onclick=()=>ls(d.isRoot?n:(d.path.replace(/[\\/]+$/,"")+(d.path.includes("\\")?"\\":"/")+n));$("dirs").appendChild(e)});
-  $("pathinfo").innerHTML=d.isRoot?"Choose a drive":(d.hasMusic?'Music folder found<span class="badge">ready</span>'+(d.hasLibrary?'<span class="badge">has library.json</span>':''):'No Music folder here<span class="badge bad">not the SD root</span>');
-  $("up").disabled=parent===null;
-}
-$("go").onclick=()=>ls($("path").value);
-$("path").onkeydown=e=>{if(e.key==="Enter")ls($("path").value)};
-$("up").onclick=()=>ls(parent??"");
-$("use").onclick=()=>{chosen=cur;localStorage.setItem("vs_root",chosen);$("pathinfo").innerHTML="Using "+chosen+'<span class="badge">selected</span>'};
-async function voices(){const v=await (await fetch("/api/voices")).json();
-  $("voice").innerHTML=v.map(x=>`<option value="${x.id}">${x.label}${x.downloaded?"":"  (downloads)"}</option>`).join("");
-  const s=localStorage.getItem("vs_voice"); if(s)$("voice").value=s;
-  const sp=localStorage.getItem("vs_speed"); if(sp)$("speed").value=sp;}
-$("voice").onchange=()=>localStorage.setItem("vs_voice",$("voice").value);
-$("speed").onchange=()=>localStorage.setItem("vs_speed",$("speed").value);
-$("preview").onclick=async()=>{$("perr").textContent="";$("preview").disabled=true;$("preview").textContent="Making...";
-  try{const r=await fetch("/api/preview",{method:"POST",headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({voice:$("voice").value,speed:$("speed").value,text:$("sample").value})});
-    if(!r.ok){$("perr").textContent=(await r.json()).error;return}
-    const a=$("audio");a.src=URL.createObjectURL(await r.blob());a.style.display="block";a.play();voices();}
-  finally{$("preview").disabled=false;$("preview").textContent="Listen"}};
-$("start").onclick=async()=>{$("serr").textContent="";
-  const root=chosen||cur;
-  const r=await fetch("/api/start",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({
-    root,voice:$("voice").value,speed:$("speed").value,quick:$("quick").checked,regen:$("regen").checked,
-    cleanup:$("cleanup").checked,menu_only:$("menuonly").checked})});
-  if(!r.ok){$("serr").textContent=(await r.json()).error;return} poll();};
-$("cancel").onclick=()=>fetch("/api/cancel",{method:"POST"});
-function fmt(s){return Math.floor(s/60)+":"+String(s%60).padStart(2,"0")}
-async function poll(){const s=await (await fetch("/api/status")).json();
-  $("start").disabled=s.running;$("cancel").disabled=!s.running;
-  const pct=s.total?Math.round(100*s.done/s.total):(s.running?5:(s.result?100:0));
-  $("fill").style.width=pct+"%";
-  let eta=""; if(s.running&&s.total&&s.done>5&&s.stage==="Voices"){eta="  ~"+fmt(Math.round(s.elapsed/s.done*(s.total-s.done)))+" left"}
-  $("status").textContent=s.stage+(s.total?` ${s.done}/${s.total}`:(s.done?` ${s.done} files`:""))+(s.item?"  "+s.item:"")+eta;
-  $("log").textContent=s.log.join("\n");$("log").scrollTop=1e9;
-  if(s.error&&s.error!=="cancelled")$("serr").textContent=s.error;
-  if(s.running)setTimeout(poll,500);}
-ls(chosen||"");voices();poll();
-</script></body></html>"""
+    return send_from_directory(HERE / "static", "index.html")
 
 
 if __name__ == "__main__":

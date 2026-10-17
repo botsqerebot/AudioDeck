@@ -113,7 +113,7 @@ private:
   }
 };
 
-enum QueueType : uint8_t { Q_NONE = 0, Q_ALBUM = 1, Q_ALL_SONGS = 2 };
+enum QueueType : uint8_t { Q_NONE = 0, Q_ALBUM = 1, Q_ALL_SONGS = 2, Q_PLAYLIST = 3 };
 enum RepeatMode : uint8_t { REPEAT_OFF = 0, REPEAT_ALL = 1, REPEAT_ONE = 2 };
 
 struct PlayerStatus {
@@ -130,7 +130,7 @@ struct Options {
   bool volTick = true;    // tick at the lowest and highest volume
   bool chime = true;      // two-tone chime at power-on
 };
-#define MENU_POS_COUNT 5  // remembered list positions (see Menu::posSlot)
+#define MENU_POS_COUNT 6  // remembered list positions (see Menu::posSlot)
 
 class Engine {
 public:
@@ -155,6 +155,7 @@ public:
   // Starting from the menu always plays in album order (shuffle and repeat reset)
   void playAlbum(int albumId, int startIndex) { Lock l(mtx); buildQueue(Q_ALBUM, albumId); startQueue(startIndex); }
   void playAllSongs(int startIndex)          { Lock l(mtx); buildQueue(Q_ALL_SONGS, -1); startQueue(startIndex); }
+  void playPlaylist(int id, int startIndex)  { Lock l(mtx); buildQueue(Q_PLAYLIST, id); startQueue(startIndex); }
 
   void togglePause() {
     Lock l(mtx);
@@ -240,9 +241,15 @@ public:
   // Voice clip for the highlighted item. Never blocks the buttons: the request goes into a
   // mailbox, and the audio task cuts the clip that is playing within ~1 ms.
   // An empty path just stops the current clip. A path to a missing file plays a short tick.
-  void speak(const String &path, bool immediate = false) {
+  void speak(const String &path, bool immediate = false) { speakSeq(&path, 1, immediate); }
+
+  // Several clips back to back ("title", "artist"). Empty paths are skipped.
+  void speakSeq(const String *paths, int n, bool immediate = false) {
+    String all;
+    for (int i = 0; i < n; i++)
+      if (paths[i].length()) { if (all.length()) all += '\n'; all += paths[i]; }
     portENTER_CRITICAL(&mbMux);
-    strncpy(mbPath, path.c_str(), sizeof(mbPath) - 1);
+    strncpy(mbPath, all.c_str(), sizeof(mbPath) - 1);
     mbPath[sizeof(mbPath) - 1] = 0;
     mbImmediate = immediate;
     mbSeq = mbSeq + 1;
@@ -274,8 +281,18 @@ public:
     saveStateLocked();
     stopSlots();
     active = false; paused = false; pausing = false;
-    pendingVoice = ""; stopVoice();
+    pendingVoice = ""; voiceQueue = ""; stopVoice();
     updateMute();
+  }
+
+  // Before power-off: stop all audio and leave the I2S pins alone, so power.h can park them
+  void shutdown() {
+    Lock l(mtx);
+    stopSlots();
+    active = false; paused = false; pausing = false;
+    pendingVoice = ""; voiceQueue = ""; stopVoice();
+    setDac(false);
+    halted = true;
   }
 
   // Home > Now Playing: if nothing is loaded, continue the last song where it stopped
@@ -368,9 +385,10 @@ private:
   bool voiceOn = false, voiceMixed = false;    // voiceMixed: the clip plays over ducked music
   volatile bool tickReq = false;
   uint32_t voiceTail = 0;
-  String pendingVoice;
+  String pendingVoice, voiceQueue;  // voiceQueue: clips still to come after this one ('\n' between)
+  bool halted = false;              // after shutdown(): the task does nothing
   portMUX_TYPE mbMux = portMUX_INITIALIZER_UNLOCKED;
-  char mbPath[128] = {0};
+  char mbPath[320] = {0};
   bool mbImmediate = false;
   volatile uint32_t mbSeq = 0;
   volatile int32_t skipReq = 0;
@@ -389,6 +407,7 @@ private:
 
   void loop() {
     Lock l(mtx);
+    if (halted) return;
     uint32_t now = millis();
 
     // ---- Next/Prev presses ----
@@ -404,6 +423,9 @@ private:
       portEXIT_CRITICAL(&mbMux);
       cutVoice();
       pendingVoice = p;
+      voiceQueue = "";
+      int nl = pendingVoice.indexOf('\n');
+      if (nl >= 0) { voiceQueue = pendingVoice.substring(nl + 1); pendingVoice.remove(nl); }
       voiceAt = now + (imm ? 0 : VOICE_HOVER_DELAY_MS);
       if (!pendingVoice.length()) musicResumeAt = 0;
     }
@@ -412,7 +434,7 @@ private:
       if (!active || paused) stopVoice();          // music stopped under the clip: drop it
       else {
         if (voiceGen.isRunning() && !voiceGen.loop()) { voiceGen.stop(); voiceSrc.close(); }   // top up the mix buffer
-        if (!voiceGen.isRunning() && out.voice.empty()) stopVoice();                          // clip fully heard
+        if (!voiceGen.isRunning() && out.voice.empty()) { stopVoice(); nextQueuedVoice(now); }  // clip fully heard
       }
     } else if (voiceOn) {
       if (!voiceTail) {
@@ -423,7 +445,7 @@ private:
       if ((int32_t)(now - voiceTail) < 0) { out.fillSilence(); return; }
       stopVoice();
       musicResumeAt = now + VOICE_RESUME_MS;
-      if (opts.fade) { out.fade.set(0); out.fadeTo(1, FADE_MS); }   // music fades back in
+      if (!nextQueuedVoice(now) && opts.fade) { out.fade.set(0); out.fadeTo(1, FADE_MS); }   // music fades back in
       updateMute();
     }
     if (pendingVoice.length() && !cutMuteUntil && (int32_t)(now - voiceAt) >= 0) {
@@ -592,6 +614,8 @@ private:
       for (JsonVariant v : lib.albums[id]["tracks"].as<JsonArray>()) items.push_back(v.as<uint16_t>());
     } else if (type == Q_ALL_SONGS) {
       items.assign(lib.allSongs.begin(), lib.allSongs.end());
+    } else if (type == Q_PLAYLIST && id >= 0 && id < (int)lib.playlists.size()) {
+      for (JsonVariant v : lib.playlists[id]["tracks"].as<JsonArray>()) items.push_back(v.as<uint16_t>());
     }
   }
   void startQueue(int startIndex) {
@@ -626,7 +650,7 @@ private:
   // ---------- voice ----------
   void startVoice() {
     String p = pendingVoice; pendingVoice = "";
-    if (!voiceSrc.open(p.c_str())) { playTick(); return; }      // clip not made yet
+    if (!voiceSrc.open(p.c_str())) { playTick(); nextQueuedVoice(millis()); return; }   // clip not made yet
     voiceTail = 0;
     // Ducking: music is really sounding, so mix the clip over it instead of pausing it
     if (opts.duck && active && !paused && !pausing && (int32_t)(millis() - musicResumeAt) >= 0) {
@@ -641,6 +665,15 @@ private:
     voiceOn = voiceGen.begin(&voiceSrc, &out);
     if (!voiceOn) { voiceSrc.close(); out.restoreFormat(); }
     updateMute();
+  }
+  // Clip done: start the next one of a speakSeq() right away
+  bool nextQueuedVoice(uint32_t now) {
+    if (!voiceQueue.length()) return false;
+    int nl = voiceQueue.indexOf('\n');
+    pendingVoice = nl < 0 ? voiceQueue : voiceQueue.substring(0, nl);
+    voiceQueue = nl < 0 ? String() : voiceQueue.substring(nl + 1);
+    voiceAt = now;
+    return true;
   }
   void stopVoice() {
     if (!voiceOn) return;

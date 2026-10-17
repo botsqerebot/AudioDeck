@@ -10,6 +10,7 @@ these clips instead of making robotic ones.
 import json
 import os
 import re
+import shutil
 import struct
 import time
 import calendar
@@ -24,6 +25,9 @@ VOICE_LIB_DIR = "/Voices/Library"
 LIBRARY_JSON = "/System/library.json"
 VOICE_MAX_CHARS = 120
 MANIFEST = "/Voices/piper_manifest.json"
+PLAYLIST_DIR = "/Playlists"
+AUDIO_EXTS = (".flac", ".mp3")
+UNSUPPORTED_EXTS = (".m4a", ".aac", ".wav", ".ogg", ".opus", ".wma", ".aif", ".aiff", ".alac", ".ape")
 
 # ---- menu texts: must match MENU_VOICES in library.h -------------------------
 MENU_VOICES = [
@@ -57,7 +61,13 @@ MENU_VOICES = [
     ("fade_on", "Soft fade on"), ("fade_off", "Soft fade off"),
     ("voltick_on", "Volume ticks on"), ("voltick_off", "Volume ticks off"),
     ("chime_on", "Startup chime on"), ("chime_off", "Startup chime off"),
+    ("music_playlists", "Playlists"),
+    ("charging", "Charging"),
+    ("battery_low", "Battery low."), ("battery_critical", "Battery critical. Powering off."),
 ]
+
+# Settings > Battery: one clip per percent (Library::batteryVoice in library.h)
+BATTERY_VOICES = [(f"battery_{n}", f"Battery {n} percent") for n in range(101)]
 
 
 def read_library_h(path):
@@ -679,12 +689,189 @@ def scan_library(root, quick=True, progress=None, cancel=None):
     genres = [{"name": genre_label(g), "albums": [album_rank[a] for a in genre_albums[g]]} for g in genre_order]
     all_songs = sorted(range(len(T)), key=lambda x: fold_key(T[x]["title"]))
 
+    playlists = scan_playlists(root, T)
     lib = {
         "version": LIBRARY_VERSION, "tracks": T, "albums": albums, "artists": artists,
-        "genres": genres, "allSongs": all_songs,
-        "counts": {"tracks": len(T), "albums": len(albums), "artists": len(artists), "genres": len(genres)},
+        "genres": genres, "allSongs": all_songs, "playlists": playlists,
+        "counts": {"tracks": len(T), "albums": len(albums), "artists": len(artists), "genres": len(genres),
+                   "playlists": len(playlists)},
     }
     return lib, reused
+
+
+# ---- playlists (scanPlaylists in library.h) ------------------------------------------
+def playlist_line(line):
+    """A playlist line -> "/Music/..." path, "" for comments and blanks."""
+    line = line.strip(SPACES)
+    if not line or line[0] == "#":
+        return ""
+    line = line.replace("\\", "/")
+    while True:
+        if line.startswith("../"):
+            line = line[3:]
+        elif line.startswith("./"):
+            line = line[2:]
+        else:
+            break
+    return line if line.startswith("/") else "/" + line
+
+
+def playlist_files(root):
+    d = Path(root) / PLAYLIST_DIR.lstrip("/")
+    if not d.is_dir():
+        return []
+    return [f for f in d.iterdir() if f.is_file() and not f.name.startswith(".")
+            and f.name.lower().endswith((".m3u8", ".m3u"))]
+
+
+def read_playlist(f):
+    """(name, [paths]) of one playlist file."""
+    raw = f.read_bytes().decode("utf-8", "replace")
+    if raw.startswith("\ufeff"):
+        raw = raw[1:]
+    paths = [p for p in (playlist_line(x) for x in raw.split("\n")) if p]
+    return f.name[:f.name.rfind(".")], paths
+
+
+def scan_playlists(root, tracks):
+    """library.json "playlists": songs that are no longer on the card are left out."""
+    by_path = {t["path"]: i for i, t in enumerate(tracks)}
+    out = []
+    for f in playlist_files(root):
+        name, paths = read_playlist(f)
+        out.append({"name": name, "tracks": [by_path[p] for p in paths if p in by_path]})
+    out.sort(key=lambda p: fold_key(p["name"]))
+    return out
+
+
+def save_playlist(root, name, paths, old_name=None):
+    """Write /Playlists/<name>.m3u8 (and remove the old file when renamed). Returns the name used."""
+    name = safe_name(name, 60)
+    d = Path(root) / PLAYLIST_DIR.lstrip("/")
+    d.mkdir(parents=True, exist_ok=True)
+    body = "#EXTM3U\n" + "".join(p + "\n" for p in paths)
+    _write_atomic(d / f"{name}.m3u8", body.encode("utf-8"))
+    if old_name and old_name != name:
+        delete_playlist(root, old_name)
+    return name
+
+
+def delete_playlist(root, name):
+    for f in playlist_files(root):
+        if f.name[:f.name.rfind(".")] == name:
+            f.unlink()
+
+
+# ---- adding music from a PC folder --------------------------------------------------------
+_BAD_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+_RESERVED = {"CON", "PRN", "AUX", "NUL"} | {f"COM{i}" for i in range(1, 10)} | {f"LPT{i}" for i in range(1, 10)}
+
+
+def safe_name(s, maxlen=80):
+    """A FAT/exFAT-safe file or folder name."""
+    s = re.sub(r"\s+", " ", _BAD_CHARS.sub("_", s)).strip()
+    s = s[:maxlen].rstrip(" .")
+    if not s:
+        s = "_"
+    if s.upper().split(".")[0] in _RESERVED:
+        s += "_"
+    return s
+
+
+def read_tags(path, fallback_rel):
+    """Tags of a PC file; gaps are filled from fallback_rel ("/Music/<folders>/<file>")."""
+    t = Tags()
+    size = path.stat().st_size
+    with open(path, "rb") as f:
+        ok = read_flac(f, t, size) if path.suffix.lower() == ".flac" else read_mp3(f, t, size)
+    if not ok:
+        return None
+    apply_fallbacks(t, fallback_rel)
+    return t
+
+
+def plan_import(root, src):
+    """What adding <src> to the card would do. Each item:
+    {src, target, status, title, artist, album}  status: copy | exists | duplicate | unsupported | unreadable
+    """
+    root, src = Path(root), Path(src)
+    files = []
+    for dirpath, dirnames, filenames in os.walk(src):
+        dirnames[:] = sorted(d for d in dirnames if not d.startswith("."))
+        files += [Path(dirpath) / n for n in sorted(filenames) if not n.startswith(".")]
+
+    # songs already on the card, by tags (a copy in another folder is still a duplicate)
+    have = set()
+    try:
+        prev = json.loads((root / LIBRARY_JSON.lstrip("/")).read_text(encoding="utf-8"))
+        for t in prev.get("tracks", []):
+            have.add((fold_key(t["albumArtist"]), fold_key(t["album"]), t.get("disc", 0), t.get("track", 0),
+                      fold_key(t["title"]), t.get("size")))
+    except (OSError, ValueError, KeyError):
+        pass
+
+    items, read = [], []
+    for f in files:
+        ext = f.suffix.lower()
+        it = {"src": str(f), "target": "", "title": f.name, "artist": "", "album": ""}
+        if ext in UNSUPPORTED_EXTS:
+            items.append(dict(it, status="unsupported"))
+            continue
+        if ext not in AUDIO_EXTS:
+            continue
+        try:
+            t = read_tags(f, MUSIC_DIR + "/" + f.relative_to(src.parent).as_posix())
+        except OSError:
+            t = None
+        if not t:
+            items.append(dict(it, status="unreadable"))
+            continue
+        read.append((f, t, it))
+        items.append(it)
+
+    discs = {}
+    for _, t, _ in read:
+        discs.setdefault((t.album_artist, t.album), set()).add(t.disc)
+    taken = set()
+    for f, t, it in read:
+        multi = len(discs[(t.album_artist, t.album)] - {0}) > 1
+        num = f"{t.disc}-{t.track:02d} " if multi and t.track else (f"{t.track:02d} " if t.track else "")
+        folder = f"{MUSIC_DIR}/{safe_name(t.album_artist)}/{safe_name(t.album)}"
+        stem = safe_name(num + t.title)
+        size = f.stat().st_size
+        it.update(title=t.title, artist=t.artist, album=t.album)
+        key = (fold_key(t.album_artist), fold_key(t.album), t.disc, t.track, fold_key(t.title), size)
+        target, n = f"{folder}/{stem}{f.suffix.lower()}", 2
+        while True:
+            dest = root / target.lstrip("/")
+            if target.lower() in taken:
+                pass
+            elif dest.exists() and dest.stat().st_size == size:
+                it.update(target=target, status="exists")
+                break
+            elif not dest.exists():
+                it.update(target=target, status="duplicate" if key in have else "copy")
+                break
+            target, n = f"{folder}/{stem} ({n}){f.suffix.lower()}", n + 1     # name taken by another song
+        taken.add(target.lower())
+    return items
+
+
+def copy_import(root, items, progress=None, log=print, cancel=None):
+    """Copy the "copy" items of plan_import(). Returns how many were copied."""
+    todo = [it for it in items if it["status"] == "copy"]
+    for i, it in enumerate(todo):
+        if cancel and cancel():
+            raise Cancelled()
+        dest = Path(root) / it["target"].lstrip("/")
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        tmp = dest.with_name(dest.name + ".part")
+        shutil.copy2(it["src"], tmp)        # keeps the date, so a later quick scan skips it
+        os.replace(tmp, dest)
+        if progress:
+            progress("Copying", i + 1, len(todo), it["title"])
+    log(f"Copied {len(todo)} songs")
+    return len(todo)
 
 
 # ---- voices -----------------------------------------------------------------------
@@ -726,58 +913,102 @@ def _write_atomic(path, data):
     os.replace(tmp, path)
 
 
+class Clips:
+    """Makes voice clips that are missing or from another voice; remembers them in the manifest."""
+
+    def __init__(self, root, tts, regen=False, cancel=None):
+        self.root, self.tts, self.regen, self.cancel = Path(root), tts, regen, cancel
+        self.path = self.root / MANIFEST.lstrip("/")
+        try:
+            self.manifest = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            self.manifest = {}
+        self.made = self.kept = 0
+
+    def make(self, text, rel):
+        if self.cancel and self.cancel():
+            raise Cancelled()
+        p = self.root / rel.lstrip("/")
+        if p.exists() and not self.regen and self.manifest.get(rel) == self.tts.tag:
+            self.kept += 1
+            return
+        _write_atomic(p, self.tts.wav_bytes(text))
+        self.manifest[rel] = self.tts.tag
+        self.made += 1
+
+    def save(self):
+        _write_atomic(self.path, json.dumps(self.manifest, indent=0).encode("utf-8"))
+
+
+def save_library(root, lib, log=print):
+    data = json.dumps(lib, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    _write_atomic(Path(root) / LIBRARY_JSON.lstrip("/"), data)
+    log(f"Saved {LIBRARY_JSON} ({len(data) // 1024} KB)")
+
+
+def update_playlists(root, tts, progress=None, log=print, cancel=None):
+    """After a playlist was saved or deleted: redo only the playlists in library.json."""
+    root = Path(root)
+    try:
+        lib = json.loads((root / LIBRARY_JSON.lstrip("/")).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        raise RuntimeError("No library.json yet: run Build first.")
+    clips = Clips(root, tts, cancel=cancel)
+    try:
+        lib["playlists"] = scan_playlists(root, lib.get("tracks", []))
+        lib.setdefault("counts", {})["playlists"] = len(lib["playlists"])
+        for i, pl in enumerate(lib["playlists"]):
+            pl["voice"] = library_voice_path(pl["name"])
+            clips.make(pl["name"], pl["voice"])
+            if progress:
+                progress("Voices", i + 1, len(lib["playlists"]), pl["name"])
+        save_library(root, lib, log)
+    finally:
+        clips.save()
+    log(f"Playlists: {len(lib['playlists'])}")
+    return {"playlists": len(lib["playlists"]), "made": clips.made, "kept": clips.kept}
+
+
 def build(root, tts, quick=True, menu_items=None, regen=False, cleanup=False, menu_only=False,
           progress=None, log=print, cancel=None):
     """Full job: scan, voices, save library.json. Returns a summary dict."""
     root = Path(root)
-    menu_items = menu_items or MENU_VOICES
-    man_path = root / MANIFEST.lstrip("/")
-    try:
-        manifest = json.loads(man_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        manifest = {}
-
-    made = kept = 0
-
-    def voice(text, rel):
-        nonlocal made, kept
-        if cancel and cancel():
-            raise Cancelled()
-        p = root / rel.lstrip("/")
-        if p.exists() and not regen and manifest.get(rel) == tts.tag:
-            kept += 1
-            return
-        _write_atomic(p, tts.wav_bytes(text))
-        manifest[rel] = tts.tag
-        made += 1
+    menu_items = list(menu_items or MENU_VOICES)
+    menu_items += [m for m in MENU_VOICES if m[0] not in {k for k, _ in menu_items}]   # older library.h
+    all_menu = menu_items + BATTERY_VOICES
+    clips = Clips(root, tts, regen=regen, cancel=cancel)
+    voice = clips.make
 
     try:
         menu_voices = {}
-        for i, (key, text) in enumerate(menu_items):
+        for i, (key, text) in enumerate(all_menu):
             rel = menu_voice_path(key, text)
             voice(text, rel)
-            menu_voices[key] = rel
+            if i < len(menu_items):           # the player lists only these in library.json
+                menu_voices[key] = rel
             if progress:
-                progress("Menu voices", i + 1, len(menu_items), text)
+                progress("Menu voices", i + 1, len(all_menu), text)
         # remove menu clips left over from older menu texts
         mdir = root / VOICE_MENU_DIR.lstrip("/")
-        for key, text in menu_items:
+        for key, text in all_menu:
             keep = path_base(menu_voice_path(key, text))
             for oldf in mdir.glob(f"{key}_??????.wav"):
                 if oldf.name != keep:
                     oldf.unlink()
-        log(f"Menu: {len(menu_items)} clips")
+        log(f"Menu: {len(all_menu)} clips")
         if menu_only:
-            return {"menu": len(menu_items), "made": made, "kept": kept}
+            return {"menu": len(all_menu), "made": clips.made, "kept": clips.kept}
 
         if not (root / "Music").is_dir():
             raise RuntimeError(f"No Music folder in {root}")
         lib, _ = scan_library(root, quick=quick, progress=progress, cancel=cancel)
         log(f"Found {lib['counts']['tracks']} songs, {lib['counts']['albums']} albums, "
-            f"{lib['counts']['artists']} artists, {lib['counts']['genres']} genres")
+            f"{lib['counts']['artists']} artists, {lib['counts']['genres']} genres, "
+            f"{lib['counts']['playlists']} playlists")
         lib["menuVoices"] = menu_voices
 
-        jobs = [(t, t["title"]) for t in lib["tracks"]] + [(o, o["name"]) for o in lib["albums"] + lib["artists"] + lib["genres"]]
+        groups = lib["albums"] + lib["artists"] + lib["genres"] + lib["playlists"]
+        jobs = [(t, t["title"]) for t in lib["tracks"]] + [(o, o["name"]) for o in groups]
         for i, (obj, text) in enumerate(jobs):
             rel = library_voice_path(text)
             voice(text, rel)
@@ -786,22 +1017,20 @@ def build(root, tts, quick=True, menu_items=None, regen=False, cleanup=False, me
                 progress("Voices", i + 1, len(jobs), text)
 
         if cleanup:
-            used = {t["voice"] for t in lib["tracks"]} | {o["voice"] for o in lib["albums"] + lib["artists"] + lib["genres"]}
+            used = {t["voice"] for t in lib["tracks"]} | {o["voice"] for o in groups}
             removed = 0
             ldir = root / VOICE_LIB_DIR.lstrip("/")
             for f in ldir.rglob("*.wav") if ldir.exists() else []:
                 rel = "/" + f.relative_to(root).as_posix()
                 if rel not in used:
                     f.unlink()
-                    manifest.pop(rel, None)
+                    clips.manifest.pop(rel, None)
                     removed += 1
             log(f"Removed {removed} unused clips")
 
         if progress:
             progress("Saving", 0, 0, "")
-        data = json.dumps(lib, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-        _write_atomic(root / LIBRARY_JSON.lstrip("/"), data)
-        log(f"Saved {LIBRARY_JSON} ({len(data) // 1024} KB)")
-        return {"songs": lib["counts"]["tracks"], "albums": lib["counts"]["albums"], "made": made, "kept": kept}
+        save_library(root, lib, log)
+        return {"songs": lib["counts"]["tracks"], "albums": lib["counts"]["albums"], "made": clips.made, "kept": clips.kept}
     finally:
-        _write_atomic(man_path, json.dumps(manifest, indent=0).encode("utf-8"))
+        clips.save()
